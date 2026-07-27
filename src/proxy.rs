@@ -40,9 +40,13 @@ pub async fn run(config: &Config, server: String, args: Vec<String>) -> Result<(
         })
         .collect();
 
-    let mut stream = Stream::connect(&config.connect)
-        .await
-        .context("connecting to server")?;
+    let mut stream = Stream::connect(&config.connect).await.with_context(|| {
+        format!(
+            "connecting to lspmux server at {:?}; start it with `lspmux server` \
+                 or `cargo run -- server` while developing",
+            config.connect,
+        )
+    })?;
     let mut stdio = BufStream::new(io::join(io::stdin(), io::stdout()));
 
     // Wait for the client to send `initialize` request.

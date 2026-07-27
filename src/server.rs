@@ -6,11 +6,17 @@ use tracing::{error, info, info_span, warn, Instrument};
 
 use crate::client;
 use crate::config::Config;
+use crate::git_worktree::PrewarmTracker;
 use crate::instance::InstanceMap;
 use crate::socketwrapper::Listener;
 
 pub async fn run(config: &Config) -> Result<()> {
     let instance_map = InstanceMap::new(config);
+    let prewarm_tracker = config.git_worktree_prewarm.then(|| {
+        let tracker = PrewarmTracker::new(config.git_worktree_poll_interval);
+        tracker.start(instance_map.clone());
+        tracker
+    });
     let next_client_id = AtomicUsize::new(0);
     let next_client_id = || next_client_id.fetch_add(1, Ordering::Relaxed);
 
@@ -21,11 +27,14 @@ pub async fn run(config: &Config) -> Result<()> {
             Ok((socket, _addr)) => {
                 let client_id = next_client_id();
                 let instance_map = instance_map.clone();
+                let prewarm_tracker = prewarm_tracker.clone();
 
                 task::spawn(
                     async move {
                         info!("client connected");
-                        match client::process(socket, client_id, instance_map).await {
+                        match client::process(socket, client_id, instance_map, prewarm_tracker)
+                            .await
+                        {
                             Ok(_) => {}
                             Err(err) => error!("client error: {err:?}"),
                         }

@@ -130,7 +130,7 @@ pub enum TraceValue {
     Verbose,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceFolder {
     pub uri: String,
     pub name: String,

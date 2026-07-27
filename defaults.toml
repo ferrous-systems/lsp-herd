@@ -1,5 +1,7 @@
 instance_timeout = 300
 gc_interval = 10
+git_worktree_prewarm = true
+git_worktree_poll_interval = 30
 listen = ["127.0.0.1", 27631]
 connect = ["127.0.0.1", 27631]
 log_filters = "info"

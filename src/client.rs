@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task;
 use tracing::{debug, error, info, warn, Instrument};
 
+use crate::git_worktree::PrewarmTracker;
 use crate::instance::{self, Instance, InstanceKey, InstanceMap, WorkspaceRoot};
 use crate::lsp::ext::{self, LspMuxOptions, Tag};
 use crate::lsp::jsonrpc::{
@@ -24,6 +25,7 @@ pub async fn process(
     socket: Stream,
     client_id: usize,
     instance_map: Arc<Mutex<InstanceMap>>,
+    prewarm_tracker: Option<Arc<PrewarmTracker>>,
 ) -> Result<()> {
     let (socket_read, socket_write) = socket.into_split();
     let mut reader = LspReader::new(BufReader::new(socket_read), "client");
@@ -69,6 +71,7 @@ pub async fn process(
             connect(
                 client_id,
                 instance_map,
+                prewarm_tracker,
                 (server, args, env, cwd),
                 req,
                 init_params,
@@ -223,6 +226,7 @@ async fn sync(
 async fn connect(
     client_id: usize,
     instance_map: Arc<Mutex<InstanceMap>>,
+    prewarm_tracker: Option<Arc<PrewarmTracker>>,
     (server, args, env, cwd): (
         String,
         Vec<String>,
@@ -237,12 +241,23 @@ async fn connect(
     // Select the workspace root directory.
     let workspace_root = select_workspace_root(&init_params, cwd.as_deref())
         .context("could not get any workspace_root")?;
+    let workspace_root_path = workspace_root.clone();
     let workspace_root = task::spawn_blocking(move || WorkspaceRoot::from_path(workspace_root))
         .await
         .expect("blocking task panicked")
         .context("get workspace_root metadata")?;
 
     // Get an language server instance for this client.
+    let prewarm_template = prewarm_tracker.map(|tracker| {
+        (
+            tracker,
+            server.clone(),
+            args.clone(),
+            env.clone(),
+            workspace_root_path,
+            init_params.clone(),
+        )
+    });
     let key = InstanceKey {
         server,
         args,
@@ -251,6 +266,17 @@ async fn connect(
     };
     let (client, client_rx) = Client::new(client_id);
     let instance = instance::get_or_spawn(instance_map, key, init_params, client.clone()).await?;
+
+    if let Some((tracker, server, args, env, workspace_root_path, init_params)) = prewarm_template {
+        task::spawn(async move {
+            if let Err(err) = tracker
+                .record_client(server, args, env, workspace_root_path, init_params)
+                .await
+            {
+                warn!(?err, "failed to record git worktree prewarm template");
+            }
+        });
+    }
 
     // Respond to client's `initialize` request using a response result from
     // the first time this server instance was initialized, it might not be

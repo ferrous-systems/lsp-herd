@@ -1,4 +1,5 @@
 mod client;
+mod git_worktree;
 mod instance;
 mod lsp;
 mod socketwrapper;

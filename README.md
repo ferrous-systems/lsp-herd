@@ -122,6 +122,20 @@ instance_timeout = 300 # after 5 minutes
 # clients and possibly starts a timeout task. the value must be at least 1.
 gc_interval = 10 # every 10 seconds
 
+# when a client opens a workspace inside a git repository, remember that
+# workspace shape and preemptively start matching language servers for other
+# worktrees of the same repository.
+git_worktree_prewarm = true
+
+# time in seconds how long to wait between checks for new or removed git
+# worktrees. the value must be at least 1.
+git_worktree_poll_interval = 30 # every 30 seconds
+
+# each worktree poll emits an info-level summary of observed repositories,
+# worktrees, desired workspace roots, and running language server processes.
+# it also emits one info-level line for each tracked worktree workspace with
+# its process status, pid, client count, and idle time.
+
 # ip address and port on which lspmux server listens
 # or unix socket path on *nix operating systems
 #

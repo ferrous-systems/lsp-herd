@@ -24,6 +24,15 @@ mod default {
         10
     }
 
+    pub fn git_worktree_prewarm() -> bool {
+        true
+    }
+
+    pub fn git_worktree_poll_interval() -> u32 {
+        // 30 seconds
+        30
+    }
+
     pub fn listen() -> Address {
         // localhost & some random unprivileged port
         Address::Tcp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 27_631)
@@ -75,6 +84,19 @@ mod de {
 
     /// make sure the value is greater than 0 to giver users feedback on invalid configuration
     pub fn gc_interval<'de, D>(deserializer: D) -> Result<u32, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match u32::deserialize(deserializer)? {
+            0 => Err(Error::invalid_value(
+                Unexpected::Unsigned(0),
+                &"an integer 1 or greater",
+            )),
+            value => Ok(value),
+        }
+    }
+
+    pub fn git_worktree_poll_interval<'de, D>(deserializer: D) -> Result<u32, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -159,6 +181,13 @@ pub struct Config {
     #[serde(deserialize_with = "de::gc_interval")]
     pub gc_interval: u32,
 
+    #[serde(default = "default::git_worktree_prewarm")]
+    pub git_worktree_prewarm: bool,
+
+    #[serde(default = "default::git_worktree_poll_interval")]
+    #[serde(deserialize_with = "de::git_worktree_poll_interval")]
+    pub git_worktree_poll_interval: u32,
+
     #[serde(default = "default::listen")]
     pub listen: Address,
 
@@ -194,6 +223,8 @@ impl Default for Config {
         Config {
             instance_timeout: default::instance_timeout(),
             gc_interval: default::gc_interval(),
+            git_worktree_prewarm: default::git_worktree_prewarm(),
+            git_worktree_poll_interval: default::git_worktree_poll_interval(),
             listen: default::listen(),
             connect: default::connect(),
             log_filters: default::log_filters(),

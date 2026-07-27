@@ -81,6 +81,10 @@ impl WorkspaceRoot {
             file_id: information.file_index(),
         })
     }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
 }
 
 impl PartialEq for WorkspaceRoot {
@@ -193,6 +197,10 @@ impl Instance {
         self.init_result.clone()
     }
 
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
     /// Add client to the instance so it can receive traffic from it
     ///
     /// It replays all registered dynamic capabilities to it.
@@ -260,6 +268,14 @@ impl Instance {
     pub async fn one_client(&self) -> Option<Client> {
         let clients = self.clients.lock().await;
         clients.values().next().map(|cd| cd.client.clone())
+    }
+
+    pub async fn client_count(&self) -> usize {
+        self.clients.lock().await.len()
+    }
+
+    pub fn request_close(&self) {
+        self.close.notify_one();
     }
 
     /// Send cleanup messages and remove remove client for client map
@@ -516,6 +532,10 @@ impl InstanceMap {
     pub fn instances(&self) -> Vec<Arc<Instance>> {
         self.0.values().cloned().collect()
     }
+
+    pub fn get(&self, key: &InstanceKey) -> Option<Arc<Instance>> {
+        self.0.get(key).cloned()
+    }
 }
 
 /// Periodically check for for idle language server instances
@@ -575,11 +595,32 @@ pub async fn get_or_spawn(
             Ok(e.get().clone())
         }
         Entry::Vacant(e) => {
-            let instance = spawn(key, init_req_params, map, client)
+            let instance = spawn(key, init_req_params, map, Some(client))
                 .await
                 .context("spawning instance")?;
             e.insert(instance.clone());
             Ok(instance)
+        }
+    }
+}
+
+/// Spawn a language server instance without attaching a client.
+///
+/// This is used for speculative prewarming. If an equivalent instance already
+/// exists, it is left untouched and `Ok(None)` is returned.
+pub async fn prewarm(
+    map: Arc<Mutex<InstanceMap>>,
+    key: InstanceKey,
+    init_req_params: lsp::InitializeParams,
+) -> Result<Option<Arc<Instance>>> {
+    match map.clone().lock().await.0.entry(key.clone()) {
+        Entry::Occupied(_) => Ok(None),
+        Entry::Vacant(e) => {
+            let instance = spawn(key, init_req_params, map, None)
+                .await
+                .context("spawning instance")?;
+            e.insert(instance.clone());
+            Ok(Some(instance))
         }
     }
 }
@@ -592,7 +633,7 @@ async fn spawn(
     // lock it within this function to not cause deadlock, only spawned tasks
     // are allowed to lock it again.
     map: Arc<Mutex<InstanceMap>>,
-    client: Client,
+    client: Option<Client>,
 ) -> Result<Arc<Instance>> {
     let mut child = Command::new(&key.server)
         .args(&key.args)
@@ -651,11 +692,13 @@ async fn spawn(
     let (message_writer, rx) = mpsc::channel(64);
 
     let mut clients = HashMap::new();
-    let client = ClientData {
-        client,
-        files: HashSet::new(),
-    };
-    clients.insert(client.id(), client);
+    if let Some(client) = client {
+        let client = ClientData {
+            client,
+            files: HashSet::new(),
+        };
+        clients.insert(client.id(), client);
+    }
 
     let instance = Arc::new(Instance {
         key,
@@ -939,13 +982,23 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                 // any client. So we'll just pick the first and let it answer.
                 debug!(?req, "server request workspace/configuration");
 
+                let id = req.id.clone();
                 req.id = req.id.tag(Tag::Forward);
 
                 if let Some(client) = instance.one_client().await {
                     let _ = client.send_message(req.into()).await;
                 } else {
-                    // If there is no client connected at this moment we'll
-                    // ignore the request.
+                    let result = empty_workspace_configuration_response(&req.params);
+                    let _ = instance
+                        .send_message(
+                            ResponseSuccess {
+                                jsonrpc: Version,
+                                result,
+                                id,
+                            }
+                            .into(),
+                        )
+                        .await;
                 }
             }
 
@@ -1018,4 +1071,13 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
             }
         }
     }
+}
+
+fn empty_workspace_configuration_response(params: &Value) -> Value {
+    let len = params
+        .get("items")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    Value::Array(vec![Value::Null; len])
 }
