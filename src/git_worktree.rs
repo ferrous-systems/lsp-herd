@@ -37,12 +37,28 @@ pub struct PrewarmTracker {
 #[derive(Default)]
 struct State {
     templates: HashMap<TemplateKey, PrewarmTemplate>,
+    repositories: HashMap<RepositoryId, HashMap<PathBuf, TrackedRepository>>,
     prewarmed_keys: HashSet<InstanceKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum RepositoryId {
+    Remote(String),
+    Local(PathBuf),
+}
+
+impl RepositoryId {
+    fn display(&self) -> String {
+        match self {
+            RepositoryId::Remote(remote) => remote.clone(),
+            RepositoryId::Local(common_dir) => common_dir.display().to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TemplateKey {
-    git_common_dir: PathBuf,
+    repository_id: RepositoryId,
     relative_workspace_root: PathBuf,
     server: String,
     args: Vec<String>,
@@ -55,10 +71,17 @@ struct PrewarmTemplate {
     init_params: InitializeParams,
 }
 
+#[derive(Clone)]
+struct TrackedRepository {
+    root: PathBuf,
+    common_dir: PathBuf,
+}
+
 #[derive(Debug)]
 struct Repository {
     root: PathBuf,
     common_dir: PathBuf,
+    id: RepositoryId,
     workspace_prefix: PathBuf,
 }
 
@@ -70,7 +93,8 @@ struct Worktree {
 
 #[derive(Default)]
 struct PollReport {
-    repos: usize,
+    repositories: usize,
+    repository_identities: usize,
     templates: usize,
     observed_worktrees: usize,
     prunable_worktrees: usize,
@@ -85,6 +109,8 @@ struct PollReport {
 }
 
 struct ProcessReport {
+    repository_id: String,
+    git_root: PathBuf,
     git_common_dir: PathBuf,
     worktree: PathBuf,
     workspace_root: PathBuf,
@@ -130,7 +156,7 @@ impl PrewarmTracker {
 
         let env_template = normalize_env(&env, &repo.root, &workspace_root);
         let key = TemplateKey {
-            git_common_dir: repo.common_dir,
+            repository_id: repo.id.clone(),
             relative_workspace_root: repo.workspace_prefix,
             server,
             args,
@@ -143,6 +169,13 @@ impl PrewarmTracker {
 
         let mut state = self.state.lock().await;
         let inserted = state.templates.insert(key, template).is_none();
+        state.repositories.entry(repo.id).or_default().insert(
+            repo.common_dir.clone(),
+            TrackedRepository {
+                root: repo.root,
+                common_dir: repo.common_dir,
+            },
+        );
         if inserted {
             info!("recorded git worktree prewarm template");
         } else {
@@ -164,162 +197,77 @@ impl PrewarmTracker {
     }
 
     async fn poll_once(&self, instance_map: Arc<Mutex<InstanceMap>>) -> Result<()> {
-        let (templates, previous_prewarmed_keys) = {
+        let (templates, repositories, previous_prewarmed_keys) = {
             let state = self.state.lock().await;
             (
                 state.templates.values().cloned().collect::<Vec<_>>(),
+                state.repositories.clone(),
                 state.prewarmed_keys.clone(),
             )
         };
 
+        let mut templates_by_repo = HashMap::<RepositoryId, Vec<PrewarmTemplate>>::new();
+        for template in templates {
+            templates_by_repo
+                .entry(template.key.repository_id.clone())
+                .or_default()
+                .push(template);
+        }
+
         let mut report = PollReport {
-            repos: templates
-                .iter()
-                .map(|template| &template.key.git_common_dir)
-                .collect::<HashSet<_>>()
-                .len(),
-            templates: templates.len(),
+            repositories: repositories.values().map(HashMap::len).sum(),
+            repository_identities: repositories.len(),
+            templates: templates_by_repo.values().map(Vec::len).sum(),
             ..PollReport::default()
         };
         let mut desired_keys = HashSet::new();
         let mut managed_keys = HashSet::new();
         let mut worktrees_by_repo = HashMap::<PathBuf, Vec<Worktree>>::new();
 
-        for template in templates {
-            if !worktrees_by_repo.contains_key(&template.key.git_common_dir) {
-                match list_worktrees(&template.key.git_common_dir).await {
-                    Ok(worktrees) => {
-                        report.observed_worktrees += worktrees.len();
-                        report.prunable_worktrees += worktrees
-                            .iter()
-                            .filter(|worktree| worktree.prunable)
-                            .count();
-                        worktrees_by_repo.insert(template.key.git_common_dir.clone(), worktrees);
-                    }
-                    Err(err) => {
-                        warn!(
-                            git_common_dir = ?template.key.git_common_dir,
-                            ?err,
-                            "failed to list git worktrees",
-                        );
-                        continue;
-                    }
-                }
-            }
+        for (repository_id, repositories) in repositories {
+            let templates = templates_by_repo
+                .get(&repository_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
 
-            let worktrees = worktrees_by_repo
-                .get(&template.key.git_common_dir)
-                .expect("worktrees inserted above");
-
-            for worktree in worktrees {
-                if worktree.prunable {
-                    continue;
-                }
-
-                let workspace_root = workspace_root_for_worktree(
-                    &worktree.path,
-                    &template.key.relative_workspace_root,
-                );
-                if !is_directory(&workspace_root).await {
-                    report.missing_workspaces += 1;
-                    report.processes.push(ProcessReport {
-                        git_common_dir: template.key.git_common_dir.clone(),
-                        worktree: worktree.path.clone(),
-                        workspace_root: workspace_root.clone(),
-                        server: template.key.server.clone(),
-                        status: "workspace-missing",
-                        pid: None,
-                        clients: None,
-                        idle_for: None,
-                    });
-                    debug!(?workspace_root, "skipping missing worktree workspace");
-                    continue;
-                }
-                report.desired_workspaces += 1;
-
-                let (key, init_params) =
-                    match build_instance(&template, &worktree.path, &workspace_root).await {
-                        Ok(instance) => instance,
+            for repository in repositories.values() {
+                if !worktrees_by_repo.contains_key(&repository.common_dir) {
+                    match list_worktrees(&repository.common_dir).await {
+                        Ok(worktrees) => {
+                            report.observed_worktrees += worktrees.len();
+                            report.prunable_worktrees += worktrees
+                                .iter()
+                                .filter(|worktree| worktree.prunable)
+                                .count();
+                            worktrees_by_repo.insert(repository.common_dir.clone(), worktrees);
+                        }
                         Err(err) => {
-                            report.processes.push(ProcessReport {
-                                git_common_dir: template.key.git_common_dir.clone(),
-                                worktree: worktree.path.clone(),
-                                workspace_root: workspace_root.clone(),
-                                server: template.key.server.clone(),
-                                status: "error",
-                                pid: None,
-                                clients: None,
-                                idle_for: None,
-                            });
                             warn!(
-                                ?workspace_root,
+                                git_common_dir = ?repository.common_dir,
                                 ?err,
-                                "failed to build prewarm instance key"
+                                "failed to list git worktrees",
                             );
                             continue;
                         }
-                    };
-
-                desired_keys.insert(key.clone());
-
-                let existing = instance_map.lock().await.get(&key);
-                if let Some(instance) = existing {
-                    if previous_prewarmed_keys.contains(&key) {
-                        instance.keep_alive();
                     }
-                    push_instance_report(
-                        &mut report,
-                        &template,
-                        &worktree.path,
-                        workspace_root,
-                        instance,
-                    )
-                    .await;
-                    managed_keys.insert(key);
-                    continue;
                 }
 
-                match instance::prewarm(instance_map.clone(), key.clone(), init_params).await {
-                    Ok(Some(_instance)) => {
-                        info!(?workspace_root, "prewarmed git worktree language server");
-                        if let Some(instance) = instance_map.lock().await.get(&key) {
-                            push_instance_report(
-                                &mut report,
-                                &template,
-                                &worktree.path,
-                                workspace_root,
-                                instance,
-                            )
-                            .await;
-                        }
-                        managed_keys.insert(key);
-                    }
-                    Ok(None) => {
-                        if let Some(instance) = instance_map.lock().await.get(&key) {
-                            push_instance_report(
-                                &mut report,
-                                &template,
-                                &worktree.path,
-                                workspace_root,
-                                instance,
-                            )
-                            .await;
-                        }
-                        managed_keys.insert(key);
-                    }
-                    Err(err) => {
-                        report.processes.push(ProcessReport {
-                            git_common_dir: template.key.git_common_dir.clone(),
-                            worktree: worktree.path.clone(),
-                            workspace_root: workspace_root.clone(),
-                            server: template.key.server.clone(),
-                            status: "spawn-error",
-                            pid: None,
-                            clients: None,
-                            idle_for: None,
-                        });
-                        warn!(?workspace_root, ?err, "failed to prewarm language server");
-                    }
+                let worktrees = worktrees_by_repo
+                    .get(&repository.common_dir)
+                    .expect("worktrees inserted above");
+
+                for template in templates {
+                    process_template_worktrees(
+                        template,
+                        repository,
+                        worktrees,
+                        &mut report,
+                        &mut desired_keys,
+                        &mut managed_keys,
+                        instance_map.clone(),
+                        &previous_prewarmed_keys,
+                    )
+                    .await;
                 }
             }
         }
@@ -346,9 +294,140 @@ impl PrewarmTracker {
     }
 }
 
+async fn process_template_worktrees(
+    template: &PrewarmTemplate,
+    repository: &TrackedRepository,
+    worktrees: &[Worktree],
+    report: &mut PollReport,
+    desired_keys: &mut HashSet<InstanceKey>,
+    managed_keys: &mut HashSet<InstanceKey>,
+    instance_map: Arc<Mutex<InstanceMap>>,
+    previous_prewarmed_keys: &HashSet<InstanceKey>,
+) {
+    for worktree in worktrees {
+        if worktree.prunable {
+            continue;
+        }
+
+        let workspace_root =
+            workspace_root_for_worktree(&worktree.path, &template.key.relative_workspace_root);
+        if !is_directory(&workspace_root).await {
+            report.missing_workspaces += 1;
+            report.processes.push(ProcessReport {
+                repository_id: template.key.repository_id.display(),
+                git_root: repository.root.clone(),
+                git_common_dir: repository.common_dir.clone(),
+                worktree: worktree.path.clone(),
+                workspace_root: workspace_root.clone(),
+                server: template.key.server.clone(),
+                status: "workspace-missing",
+                pid: None,
+                clients: None,
+                idle_for: None,
+            });
+            debug!(?workspace_root, "skipping missing worktree workspace");
+            continue;
+        }
+        report.desired_workspaces += 1;
+
+        let (key, init_params) =
+            match build_instance(template, &worktree.path, &workspace_root).await {
+                Ok(instance) => instance,
+                Err(err) => {
+                    report.processes.push(ProcessReport {
+                        repository_id: template.key.repository_id.display(),
+                        git_root: repository.root.clone(),
+                        git_common_dir: repository.common_dir.clone(),
+                        worktree: worktree.path.clone(),
+                        workspace_root: workspace_root.clone(),
+                        server: template.key.server.clone(),
+                        status: "error",
+                        pid: None,
+                        clients: None,
+                        idle_for: None,
+                    });
+                    warn!(
+                        ?workspace_root,
+                        ?err,
+                        "failed to build prewarm instance key"
+                    );
+                    continue;
+                }
+            };
+
+        desired_keys.insert(key.clone());
+
+        let existing = instance_map.lock().await.get(&key);
+        if let Some(instance) = existing {
+            if previous_prewarmed_keys.contains(&key) {
+                instance.keep_alive();
+            }
+            push_instance_report(
+                report,
+                template,
+                repository,
+                &worktree.path,
+                workspace_root,
+                instance,
+            )
+            .await;
+            managed_keys.insert(key);
+            continue;
+        }
+
+        match instance::prewarm(instance_map.clone(), key.clone(), init_params).await {
+            Ok(Some(_instance)) => {
+                info!(?workspace_root, "prewarmed git worktree language server");
+                if let Some(instance) = instance_map.lock().await.get(&key) {
+                    push_instance_report(
+                        report,
+                        template,
+                        repository,
+                        &worktree.path,
+                        workspace_root,
+                        instance,
+                    )
+                    .await;
+                }
+                managed_keys.insert(key);
+            }
+            Ok(None) => {
+                if let Some(instance) = instance_map.lock().await.get(&key) {
+                    push_instance_report(
+                        report,
+                        template,
+                        repository,
+                        &worktree.path,
+                        workspace_root,
+                        instance,
+                    )
+                    .await;
+                }
+                managed_keys.insert(key);
+            }
+            Err(err) => {
+                report.processes.push(ProcessReport {
+                    repository_id: template.key.repository_id.display(),
+                    git_root: repository.root.clone(),
+                    git_common_dir: repository.common_dir.clone(),
+                    worktree: worktree.path.clone(),
+                    workspace_root: workspace_root.clone(),
+                    server: template.key.server.clone(),
+                    status: "spawn-error",
+                    pid: None,
+                    clients: None,
+                    idle_for: None,
+                });
+                warn!(?workspace_root, ?err, "failed to prewarm language server");
+            }
+        }
+    }
+}
+
 async fn push_instance_report(
     report: &mut PollReport,
     template: &PrewarmTemplate,
+    repository: &TrackedRepository,
     worktree: &Path,
     workspace_root: PathBuf,
     instance: Arc<instance::Instance>,
@@ -367,7 +446,9 @@ async fn push_instance_report(
         report.connected += 1;
     }
     report.processes.push(ProcessReport {
-        git_common_dir: template.key.git_common_dir.clone(),
+        repository_id: template.key.repository_id.display(),
+        git_root: repository.root.clone(),
+        git_common_dir: repository.common_dir.clone(),
         worktree: worktree.to_owned(),
         workspace_root,
         server: template.key.server.clone(),
@@ -380,7 +461,8 @@ async fn push_instance_report(
 
 fn log_report(report: &PollReport) {
     info!(
-        repos = report.repos,
+        repositories = report.repositories,
+        repository_identities = report.repository_identities,
         templates = report.templates,
         worktrees = report.observed_worktrees,
         prunable_worktrees = report.prunable_worktrees,
@@ -396,6 +478,8 @@ fn log_report(report: &PollReport) {
 
     for process in &report.processes {
         info!(
+            repository_id = %process.repository_id,
+            git_root = ?process.git_root,
             git_common_dir = ?process.git_common_dir,
             worktree = ?process.worktree,
             workspace_root = ?process.workspace_root,
@@ -488,12 +572,73 @@ async fn discover_repository(workspace_root: &Path) -> Result<Option<Repository>
     let prefix = lines
         .next()
         .context("git rev-parse output missing workspace prefix")?;
+    let common_dir = PathBuf::from(common_dir);
+    let remote_url = discover_remote_url(workspace_root).await?;
 
     Ok(Some(Repository {
         root: PathBuf::from(root),
-        common_dir: PathBuf::from(common_dir),
+        common_dir: common_dir.clone(),
+        id: repository_id(remote_url, &common_dir),
         workspace_prefix: prefix_to_relative_path(prefix),
     }))
+}
+
+async fn discover_remote_url(workspace_root: &Path) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .await
+        .context("running git remote get-url origin")?;
+
+    if output.status.success() {
+        let stdout =
+            String::from_utf8(output.stdout).context("git remote get-url output was not utf-8")?;
+        let url = stdout.trim();
+        if !url.is_empty() {
+            return Ok(Some(url.to_owned()));
+        }
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["remote", "-v"])
+        .output()
+        .await
+        .context("running git remote -v")?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("git remote -v output was not utf-8")?;
+    Ok(first_fetch_remote_url(&stdout))
+}
+
+fn repository_id(remote_url: Option<String>, common_dir: &Path) -> RepositoryId {
+    remote_url.map_or_else(
+        || RepositoryId::Local(common_dir.to_owned()),
+        RepositoryId::Remote,
+    )
+}
+
+fn first_fetch_remote_url(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(_name) = fields.next() else {
+            continue;
+        };
+        let Some(url) = fields.next() else {
+            continue;
+        };
+        if fields.next() == Some("(fetch)") {
+            return Some(url.to_owned());
+        }
+    }
+
+    None
 }
 
 async fn list_worktrees(git_common_dir: &Path) -> Result<Vec<Worktree>> {
@@ -725,6 +870,37 @@ mod tests {
         assert_eq!(
             prefix_to_relative_path("crates/server/"),
             PathBuf::from("crates/server")
+        );
+    }
+
+    #[test]
+    fn parses_first_fetch_remote_url() {
+        assert_eq!(
+            first_fetch_remote_url(
+                "origin\tgit@github.com:slint-ui/slint.git (fetch)\n\
+                 origin\tgit@github.com:slint-ui/slint.git (push)\n",
+            )
+            .as_deref(),
+            Some("git@github.com:slint-ui/slint.git")
+        );
+        assert_eq!(
+            first_fetch_remote_url("origin\tgit@github.com:slint-ui/slint.git (push)\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn repository_id_prefers_remote_and_falls_back_to_local_common_dir() {
+        assert_eq!(
+            repository_id(
+                Some("git@github.com:slint-ui/slint.git".into()),
+                Path::new("/repo/.git"),
+            ),
+            RepositoryId::Remote("git@github.com:slint-ui/slint.git".into())
+        );
+        assert_eq!(
+            repository_id(None, Path::new("/repo/.git")),
+            RepositoryId::Local(PathBuf::from("/repo/.git"))
         );
     }
 
