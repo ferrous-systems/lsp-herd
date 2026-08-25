@@ -42,12 +42,19 @@ struct State {
     repositories: HashMap<RepositoryId, HashMap<PathBuf, TrackedRepository>>,
     prewarmed_keys: HashSet<InstanceKey>,
     last_prewarm_spawn: Option<LastPrewarmSpawn>,
+    last_report: Option<LastPollReport>,
 }
 
 #[derive(Clone)]
 struct LastPrewarmSpawn {
     at: Instant,
     key: Option<InstanceKey>,
+}
+
+#[derive(Clone)]
+struct LastPollReport {
+    updated_at: SystemTime,
+    report: PollReport,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -108,7 +115,7 @@ struct PrewarmCandidate {
     worktree: Worktree,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PollReport {
     repositories: usize,
     repository_identities: usize,
@@ -126,6 +133,7 @@ struct PollReport {
     processes: Vec<ProcessReport>,
 }
 
+#[derive(Clone)]
 struct ProcessReport {
     repository_id: String,
     git_root: PathBuf,
@@ -133,11 +141,53 @@ struct ProcessReport {
     worktree: PathBuf,
     workspace_root: PathBuf,
     worktree_last_changed: Option<SystemTime>,
+    target_dir: Option<PathBuf>,
     server: String,
     status: &'static str,
     pid: Option<u32>,
     clients: Option<usize>,
     idle_for: Option<i64>,
+    server_ready: Option<bool>,
+}
+
+impl ProcessReport {
+    fn snapshot(&self) -> PrewarmProcessSnapshot {
+        PrewarmProcessSnapshot {
+            repository_id: self.repository_id.clone(),
+            worktree: self.worktree.clone(),
+            workspace_root: self.workspace_root.clone(),
+            worktree_last_changed: self.worktree_last_changed,
+            target_dir: self.target_dir.clone(),
+            server: self.server.clone(),
+            status: self.status.to_owned(),
+            pid: self.pid,
+            clients: self.clients,
+            idle_for: self.idle_for,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PrewarmSnapshot {
+    pub updated_at: Option<SystemTime>,
+    pub repositories: usize,
+    pub repository_identities: usize,
+    pub templates: usize,
+    pub worktrees: Vec<PrewarmProcessSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PrewarmProcessSnapshot {
+    pub repository_id: String,
+    pub worktree: PathBuf,
+    pub workspace_root: PathBuf,
+    pub worktree_last_changed: Option<SystemTime>,
+    pub target_dir: Option<PathBuf>,
+    pub server: String,
+    pub status: String,
+    pub pid: Option<u32>,
+    pub clients: Option<usize>,
+    pub idle_for: Option<i64>,
 }
 
 impl PrewarmTracker {
@@ -156,6 +206,32 @@ impl PrewarmTracker {
             }
             .instrument(info_span!("git worktree prewarm")),
         );
+    }
+
+    pub async fn snapshot(&self) -> PrewarmSnapshot {
+        let state = self.state.lock().await;
+        let Some(last_report) = &state.last_report else {
+            return PrewarmSnapshot {
+                updated_at: None,
+                repositories: state.repositories.values().map(HashMap::len).sum(),
+                repository_identities: state.repositories.len(),
+                templates: state.templates.len(),
+                worktrees: Vec::new(),
+            };
+        };
+
+        PrewarmSnapshot {
+            updated_at: Some(last_report.updated_at),
+            repositories: last_report.report.repositories,
+            repository_identities: last_report.report.repository_identities,
+            templates: last_report.report.templates,
+            worktrees: last_report
+                .report
+                .processes
+                .iter()
+                .map(ProcessReport::snapshot)
+                .collect(),
+        }
     }
 
     #[instrument(skip_all, fields(workspace_root = %workspace_root))]
@@ -331,6 +407,10 @@ impl PrewarmTracker {
                 key: spawned_key,
             });
         }
+        state.last_report = Some(LastPollReport {
+            updated_at: SystemTime::now(),
+            report: report.clone(),
+        });
 
         log_report(&report);
 
@@ -366,11 +446,13 @@ async fn process_candidate(
             worktree: worktree.path.clone(),
             workspace_root: workspace_root.clone(),
             worktree_last_changed: worktree.last_changed,
+            target_dir: None,
             server: template.key.server.clone(),
             status: "workspace-missing",
             pid: None,
             clients: None,
             idle_for: None,
+            server_ready: None,
         });
         debug!(?workspace_root, "skipping missing worktree workspace");
         return;
@@ -388,11 +470,13 @@ async fn process_candidate(
                 worktree: worktree.path.clone(),
                 workspace_root: workspace_root.clone(),
                 worktree_last_changed: worktree.last_changed,
+                target_dir: None,
                 server: template.key.server.clone(),
                 status: "error",
                 pid: None,
                 clients: None,
                 idle_for: None,
+                server_ready: None,
             });
             warn!(
                 ?workspace_root,
@@ -404,6 +488,7 @@ async fn process_candidate(
     };
 
     desired_keys.insert(key.clone());
+    let target_dir = instance::expected_rust_analyzer_target_dir(instance_map.clone(), &key).await;
 
     let existing = instance_map.lock().await.get(&key);
     if let Some(instance) = existing {
@@ -433,11 +518,13 @@ async fn process_candidate(
             worktree: worktree.path.clone(),
             workspace_root,
             worktree_last_changed: worktree.last_changed,
+            target_dir,
             server: template.key.server.clone(),
             status: "queued",
             pid: None,
             clients: None,
             idle_for: None,
+            server_ready: None,
         });
         return;
     }
@@ -486,11 +573,13 @@ async fn process_candidate(
                 worktree: worktree.path.clone(),
                 workspace_root: workspace_root.clone(),
                 worktree_last_changed: worktree.last_changed,
+                target_dir,
                 server: template.key.server.clone(),
                 status: "spawn-error",
                 pid: None,
                 clients: None,
                 idle_for: None,
+                server_ready: None,
             });
             warn!(?workspace_root, ?err, "failed to prewarm language server");
         }
@@ -506,15 +595,17 @@ async fn push_instance_report(
     worktree_last_changed: Option<SystemTime>,
     instance: Arc<instance::Instance>,
 ) {
-    let clients = instance.client_count().await;
-    let status = if clients == 0 {
+    let snapshot = instance.snapshot().await;
+    let status = if !snapshot.server_ready {
+        "initializing"
+    } else if snapshot.clients == 0 {
         "prewarmed"
     } else {
         "connected"
     };
 
     report.running += 1;
-    if clients == 0 {
+    if snapshot.clients == 0 {
         report.prewarmed += 1;
     } else {
         report.connected += 1;
@@ -526,11 +617,13 @@ async fn push_instance_report(
         worktree: worktree.to_owned(),
         workspace_root,
         worktree_last_changed,
+        target_dir: snapshot.rust_analyzer_target_dir,
         server: template.key.server.clone(),
         status,
-        pid: Some(instance.pid()),
-        clients: Some(clients),
-        idle_for: Some(instance.idle()),
+        pid: Some(snapshot.pid),
+        clients: Some(snapshot.clients),
+        idle_for: Some(snapshot.idle_for),
+        server_ready: Some(snapshot.server_ready),
     });
 }
 
@@ -560,11 +653,13 @@ fn log_report(report: &PollReport) {
             worktree = ?process.worktree,
             workspace_root = ?process.workspace_root,
             worktree_last_changed = ?process.worktree_last_changed,
+            target_dir = ?process.target_dir,
             server = ?process.server,
             status = process.status,
             pid = ?process.pid,
             clients = ?process.clients,
             idle_for = ?process.idle_for,
+            server_ready = ?process.server_ready,
             "git worktree language server status",
         );
     }

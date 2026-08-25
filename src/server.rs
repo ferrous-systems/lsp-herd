@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
@@ -9,6 +10,7 @@ use crate::config::Config;
 use crate::git_worktree::PrewarmTracker;
 use crate::instance::InstanceMap;
 use crate::socketwrapper::Listener;
+use crate::tui;
 
 pub async fn run(config: &Config) -> Result<()> {
     let instance_map = InstanceMap::new(config);
@@ -17,6 +19,9 @@ pub async fn run(config: &Config) -> Result<()> {
         tracker.start(instance_map.clone());
         tracker
     });
+    if config.status_ui && std::io::stdout().is_terminal() {
+        tui::start(instance_map.clone(), prewarm_tracker.clone());
+    }
     let next_client_id = AtomicUsize::new(0);
     let next_client_id = || next_client_id.fetch_add(1, Ordering::Relaxed);
 

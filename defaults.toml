@@ -4,6 +4,7 @@ git_worktree_prewarm = true
 git_worktree_poll_interval = 30
 rust_analyzer_target_dir_root = "${cache_dir}/rust-analyzer-targets"
 rust_analyzer_target_dir_grouping = "per-instance"
+status_ui = true
 listen = ["127.0.0.1", 27631]
 connect = ["127.0.0.1", 27631]
 log_filters = "info"

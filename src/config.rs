@@ -40,6 +40,10 @@ mod default {
         RustAnalyzerTargetDirGrouping::PerInstance
     }
 
+    pub fn status_ui() -> bool {
+        true
+    }
+
     pub fn listen() -> Address {
         // localhost & some random unprivileged port
         Address::Tcp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 27_631)
@@ -209,6 +213,9 @@ pub struct Config {
     #[serde(default = "default::rust_analyzer_target_dir_grouping")]
     pub rust_analyzer_target_dir_grouping: RustAnalyzerTargetDirGrouping,
 
+    #[serde(default = "default::status_ui")]
+    pub status_ui: bool,
+
     #[serde(default = "default::listen")]
     pub listen: Address,
 
@@ -264,6 +271,7 @@ impl Default for Config {
             git_worktree_poll_interval: default::git_worktree_poll_interval(),
             rust_analyzer_target_dir_root: default::rust_analyzer_target_dir_root(),
             rust_analyzer_target_dir_grouping: default::rust_analyzer_target_dir_grouping(),
+            status_ui: default::status_ui(),
             listen: default::listen(),
             connect: default::connect(),
             log_filters: default::log_filters(),

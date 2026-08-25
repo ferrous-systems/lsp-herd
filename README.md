@@ -151,6 +151,10 @@ rust_analyzer_target_dir_root = "${cache_dir}/rust-analyzer-targets"
 # - "per-instance" uses one target directory per lspmux rust-analyzer instance.
 rust_analyzer_target_dir_grouping = "per-instance"
 
+# when lspmux server runs with stdout attached to a terminal, show a
+# periodically refreshed status UI. non-terminal service runs stay quiet.
+status_ui = true
+
 # ip address and port on which lspmux server listens
 # or unix socket path on *nix operating systems
 #

@@ -3,6 +3,7 @@ mod git_worktree;
 mod instance;
 mod lsp;
 mod socketwrapper;
+mod tui;
 
 pub mod config;
 pub mod ext;

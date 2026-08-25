@@ -140,6 +140,9 @@ pub struct Instance {
 
     /// Whether the server has reported that startup/background work is done.
     server_ready: AtomicBool,
+
+    /// rust-analyzer target directory injected into initialization options.
+    rust_analyzer_target_dir: Option<PathBuf>,
 }
 
 impl Drop for Instance {
@@ -206,6 +209,18 @@ impl Instance {
 
     pub fn server_ready(&self) -> bool {
         self.server_ready.load(Ordering::Relaxed)
+    }
+
+    pub async fn snapshot(&self) -> InstanceSnapshot {
+        InstanceSnapshot {
+            pid: self.pid(),
+            server: self.key.server.clone(),
+            workspace_root: PathBuf::from(self.key.workspace_root.path.clone()),
+            clients: self.client_count().await,
+            idle_for: self.idle(),
+            server_ready: self.server_ready(),
+            rust_analyzer_target_dir: self.rust_analyzer_target_dir.clone(),
+        }
     }
 
     fn mark_server_ready(&self) {
@@ -514,6 +529,17 @@ impl Instance {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct InstanceSnapshot {
+    pub pid: u32,
+    pub server: String,
+    pub workspace_root: PathBuf,
+    pub clients: usize,
+    pub idle_for: i64,
+    pub server_ready: bool,
+    pub rust_analyzer_target_dir: Option<PathBuf>,
+}
+
 pub struct InstanceMap {
     instances: HashMap<InstanceKey, Arc<Instance>>,
     rust_analyzer_target_dirs: RustAnalyzerTargetDirs,
@@ -669,9 +695,9 @@ async fn apply_rust_analyzer_target_dir(
     key: &InstanceKey,
     config: &RustAnalyzerTargetDirs,
     init_req_params: &mut lsp::InitializeParams,
-) -> Result<()> {
+) -> Result<Option<PathBuf>> {
     if !is_rust_analyzer_server(&key.server) {
-        return Ok(());
+        return Ok(None);
     }
 
     let target_dir = rust_analyzer_target_dir(key, config).await?;
@@ -681,7 +707,19 @@ async fn apply_rust_analyzer_target_dir(
     set_rust_analyzer_target_dir(init_req_params, &target_dir)?;
 
     info!(?target_dir, "configured rust-analyzer target directory");
-    Ok(())
+    Ok(Some(target_dir))
+}
+
+pub async fn expected_rust_analyzer_target_dir(
+    map: Arc<Mutex<InstanceMap>>,
+    key: &InstanceKey,
+) -> Option<PathBuf> {
+    if !is_rust_analyzer_server(&key.server) {
+        return None;
+    }
+
+    let config = map.lock().await.rust_analyzer_target_dirs.clone();
+    rust_analyzer_target_dir(key, &config).await.ok()
 }
 
 async fn rust_analyzer_target_dir(
@@ -824,9 +862,10 @@ async fn spawn(
     rust_analyzer_target_dirs: RustAnalyzerTargetDirs,
     client: Option<Client>,
 ) -> Result<Arc<Instance>> {
-    apply_rust_analyzer_target_dir(&key, &rust_analyzer_target_dirs, &mut init_req_params)
-        .await
-        .context("configure rust-analyzer target directory")?;
+    let rust_analyzer_target_dir =
+        apply_rust_analyzer_target_dir(&key, &rust_analyzer_target_dirs, &mut init_req_params)
+            .await
+            .context("configure rust-analyzer target directory")?;
 
     let mut child = Command::new(&key.server)
         .args(&key.args)
@@ -903,6 +942,7 @@ async fn spawn(
         close: Notify::new(),
         last_used: AtomicI64::new(elapsed_seconds()),
         server_ready: AtomicBool::new(false),
+        rust_analyzer_target_dir,
     });
 
     task::spawn(stdout_task(instance.clone(), reader).in_current_span());
