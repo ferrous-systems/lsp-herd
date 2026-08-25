@@ -134,7 +134,10 @@ git_worktree_poll_interval = 30 # every 30 seconds
 # each worktree poll emits an info-level summary of observed repositories,
 # worktrees, desired workspace roots, and running language server processes.
 # it also emits one info-level line for each tracked worktree workspace with
-# its process status, pid, client count, and idle time.
+# its process status, pid, client count, idle time, and worktree change time.
+# missing prewarmed instances are started from most recently changed worktree to
+# least recently changed, with at most one speculative spawn per minute unless
+# the previous server reports that startup/background work is done.
 
 # ip address and port on which lspmux server listens
 # or unix socket path on *nix operating systems

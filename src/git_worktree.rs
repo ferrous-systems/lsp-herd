@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
@@ -15,6 +16,7 @@ use crate::lsp::{InitializeParams, WorkspaceFolder};
 
 const WORKSPACE_ROOT_ENV: &str = "${LSPMUX_WORKSPACE_ROOT}";
 const GIT_ROOT_ENV: &str = "${LSPMUX_GIT_ROOT}";
+const PREWARM_SPAWN_INTERVAL: Duration = Duration::from_secs(60);
 
 const URI_PATH_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -39,6 +41,13 @@ struct State {
     templates: HashMap<TemplateKey, PrewarmTemplate>,
     repositories: HashMap<RepositoryId, HashMap<PathBuf, TrackedRepository>>,
     prewarmed_keys: HashSet<InstanceKey>,
+    last_prewarm_spawn: Option<LastPrewarmSpawn>,
+}
+
+#[derive(Clone)]
+struct LastPrewarmSpawn {
+    at: Instant,
+    key: Option<InstanceKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -89,6 +98,14 @@ struct Repository {
 struct Worktree {
     path: PathBuf,
     prunable: bool,
+    last_changed: Option<SystemTime>,
+}
+
+#[derive(Clone)]
+struct PrewarmCandidate {
+    template: PrewarmTemplate,
+    repository: TrackedRepository,
+    worktree: Worktree,
 }
 
 #[derive(Default)]
@@ -103,6 +120,7 @@ struct PollReport {
     running: usize,
     connected: usize,
     prewarmed: usize,
+    queued: usize,
     stale_closed: usize,
     stale_retained: usize,
     processes: Vec<ProcessReport>,
@@ -114,6 +132,7 @@ struct ProcessReport {
     git_common_dir: PathBuf,
     worktree: PathBuf,
     workspace_root: PathBuf,
+    worktree_last_changed: Option<SystemTime>,
     server: String,
     status: &'static str,
     pid: Option<u32>,
@@ -197,14 +216,17 @@ impl PrewarmTracker {
     }
 
     async fn poll_once(&self, instance_map: Arc<Mutex<InstanceMap>>) -> Result<()> {
-        let (templates, repositories, previous_prewarmed_keys) = {
+        let (templates, repositories, previous_prewarmed_keys, last_prewarm_spawn) = {
             let state = self.state.lock().await;
             (
                 state.templates.values().cloned().collect::<Vec<_>>(),
                 state.repositories.clone(),
                 state.prewarmed_keys.clone(),
+                state.last_prewarm_spawn.clone(),
             )
         };
+        let spawn_available =
+            prewarm_spawn_available(instance_map.clone(), last_prewarm_spawn.as_ref()).await;
 
         let mut templates_by_repo = HashMap::<RepositoryId, Vec<PrewarmTemplate>>::new();
         for template in templates {
@@ -223,6 +245,7 @@ impl PrewarmTracker {
         let mut desired_keys = HashSet::new();
         let mut managed_keys = HashSet::new();
         let mut worktrees_by_repo = HashMap::<PathBuf, Vec<Worktree>>::new();
+        let mut candidates = Vec::new();
 
         for (repository_id, repositories) in repositories {
             let templates = templates_by_repo
@@ -257,19 +280,34 @@ impl PrewarmTracker {
                     .expect("worktrees inserted above");
 
                 for template in templates {
-                    process_template_worktrees(
-                        template,
-                        repository,
-                        worktrees,
-                        &mut report,
-                        &mut desired_keys,
-                        &mut managed_keys,
-                        instance_map.clone(),
-                        &previous_prewarmed_keys,
-                    )
-                    .await;
+                    for worktree in worktrees.iter().filter(|worktree| !worktree.prunable) {
+                        candidates.push(PrewarmCandidate {
+                            template: template.clone(),
+                            repository: repository.clone(),
+                            worktree: worktree.clone(),
+                        });
+                    }
                 }
             }
+        }
+        sort_candidates_by_recency(&mut candidates);
+
+        let mut spawn_budget = usize::from(spawn_available);
+        let mut spawn_attempted = false;
+        let mut spawned_key = None;
+        for candidate in candidates {
+            process_candidate(
+                candidate,
+                &mut report,
+                &mut desired_keys,
+                &mut managed_keys,
+                instance_map.clone(),
+                &previous_prewarmed_keys,
+                &mut spawn_budget,
+                &mut spawn_attempted,
+                &mut spawned_key,
+            )
+            .await;
         }
 
         let mut retained_stale_keys = HashSet::new();
@@ -287,6 +325,12 @@ impl PrewarmTracker {
             .prewarmed_keys
             .retain(|key| desired_keys.contains(key) || retained_stale_keys.contains(key));
         state.prewarmed_keys.extend(managed_keys);
+        if spawn_attempted {
+            state.last_prewarm_spawn = Some(LastPrewarmSpawn {
+                at: Instant::now(),
+                key: spawned_key,
+            });
+        }
 
         log_report(&report);
 
@@ -294,132 +338,161 @@ impl PrewarmTracker {
     }
 }
 
-async fn process_template_worktrees(
-    template: &PrewarmTemplate,
-    repository: &TrackedRepository,
-    worktrees: &[Worktree],
+async fn process_candidate(
+    candidate: PrewarmCandidate,
     report: &mut PollReport,
     desired_keys: &mut HashSet<InstanceKey>,
     managed_keys: &mut HashSet<InstanceKey>,
     instance_map: Arc<Mutex<InstanceMap>>,
     previous_prewarmed_keys: &HashSet<InstanceKey>,
+    spawn_budget: &mut usize,
+    spawn_attempted: &mut bool,
+    spawned_key: &mut Option<InstanceKey>,
 ) {
-    for worktree in worktrees {
-        if worktree.prunable {
-            continue;
-        }
+    let PrewarmCandidate {
+        template,
+        repository,
+        worktree,
+    } = candidate;
 
-        let workspace_root =
-            workspace_root_for_worktree(&worktree.path, &template.key.relative_workspace_root);
-        if !is_directory(&workspace_root).await {
-            report.missing_workspaces += 1;
+    let workspace_root =
+        workspace_root_for_worktree(&worktree.path, &template.key.relative_workspace_root);
+    if !is_directory(&workspace_root).await {
+        report.missing_workspaces += 1;
+        report.processes.push(ProcessReport {
+            repository_id: template.key.repository_id.display(),
+            git_root: repository.root.clone(),
+            git_common_dir: repository.common_dir.clone(),
+            worktree: worktree.path.clone(),
+            workspace_root: workspace_root.clone(),
+            worktree_last_changed: worktree.last_changed,
+            server: template.key.server.clone(),
+            status: "workspace-missing",
+            pid: None,
+            clients: None,
+            idle_for: None,
+        });
+        debug!(?workspace_root, "skipping missing worktree workspace");
+        return;
+    }
+    report.desired_workspaces += 1;
+
+    let (key, init_params) = match build_instance(&template, &worktree.path, &workspace_root).await
+    {
+        Ok(instance) => instance,
+        Err(err) => {
             report.processes.push(ProcessReport {
                 repository_id: template.key.repository_id.display(),
                 git_root: repository.root.clone(),
                 git_common_dir: repository.common_dir.clone(),
                 worktree: worktree.path.clone(),
                 workspace_root: workspace_root.clone(),
+                worktree_last_changed: worktree.last_changed,
                 server: template.key.server.clone(),
-                status: "workspace-missing",
+                status: "error",
                 pid: None,
                 clients: None,
                 idle_for: None,
             });
-            debug!(?workspace_root, "skipping missing worktree workspace");
-            continue;
+            warn!(
+                ?workspace_root,
+                ?err,
+                "failed to build prewarm instance key"
+            );
+            return;
         }
-        report.desired_workspaces += 1;
+    };
 
-        let (key, init_params) =
-            match build_instance(template, &worktree.path, &workspace_root).await {
-                Ok(instance) => instance,
-                Err(err) => {
-                    report.processes.push(ProcessReport {
-                        repository_id: template.key.repository_id.display(),
-                        git_root: repository.root.clone(),
-                        git_common_dir: repository.common_dir.clone(),
-                        worktree: worktree.path.clone(),
-                        workspace_root: workspace_root.clone(),
-                        server: template.key.server.clone(),
-                        status: "error",
-                        pid: None,
-                        clients: None,
-                        idle_for: None,
-                    });
-                    warn!(
-                        ?workspace_root,
-                        ?err,
-                        "failed to build prewarm instance key"
-                    );
-                    continue;
-                }
-            };
+    desired_keys.insert(key.clone());
 
-        desired_keys.insert(key.clone());
+    let existing = instance_map.lock().await.get(&key);
+    if let Some(instance) = existing {
+        if previous_prewarmed_keys.contains(&key) {
+            instance.keep_alive();
+        }
+        push_instance_report(
+            report,
+            &template,
+            &repository,
+            &worktree.path,
+            workspace_root,
+            worktree.last_changed,
+            instance,
+        )
+        .await;
+        managed_keys.insert(key);
+        return;
+    }
 
-        let existing = instance_map.lock().await.get(&key);
-        if let Some(instance) = existing {
-            if previous_prewarmed_keys.contains(&key) {
-                instance.keep_alive();
+    if *spawn_budget == 0 {
+        report.queued += 1;
+        report.processes.push(ProcessReport {
+            repository_id: template.key.repository_id.display(),
+            git_root: repository.root.clone(),
+            git_common_dir: repository.common_dir.clone(),
+            worktree: worktree.path.clone(),
+            workspace_root,
+            worktree_last_changed: worktree.last_changed,
+            server: template.key.server.clone(),
+            status: "queued",
+            pid: None,
+            clients: None,
+            idle_for: None,
+        });
+        return;
+    }
+
+    *spawn_budget -= 1;
+    *spawn_attempted = true;
+
+    match instance::prewarm(instance_map.clone(), key.clone(), init_params).await {
+        Ok(Some(_instance)) => {
+            info!(?workspace_root, "prewarmed git worktree language server");
+            *spawned_key = Some(key.clone());
+            if let Some(instance) = instance_map.lock().await.get(&key) {
+                push_instance_report(
+                    report,
+                    &template,
+                    &repository,
+                    &worktree.path,
+                    workspace_root,
+                    worktree.last_changed,
+                    instance,
+                )
+                .await;
             }
-            push_instance_report(
-                report,
-                template,
-                repository,
-                &worktree.path,
-                workspace_root,
-                instance,
-            )
-            .await;
             managed_keys.insert(key);
-            continue;
         }
-
-        match instance::prewarm(instance_map.clone(), key.clone(), init_params).await {
-            Ok(Some(_instance)) => {
-                info!(?workspace_root, "prewarmed git worktree language server");
-                if let Some(instance) = instance_map.lock().await.get(&key) {
-                    push_instance_report(
-                        report,
-                        template,
-                        repository,
-                        &worktree.path,
-                        workspace_root,
-                        instance,
-                    )
-                    .await;
-                }
-                managed_keys.insert(key);
+        Ok(None) => {
+            if let Some(instance) = instance_map.lock().await.get(&key) {
+                push_instance_report(
+                    report,
+                    &template,
+                    &repository,
+                    &worktree.path,
+                    workspace_root,
+                    worktree.last_changed,
+                    instance,
+                )
+                .await;
             }
-            Ok(None) => {
-                if let Some(instance) = instance_map.lock().await.get(&key) {
-                    push_instance_report(
-                        report,
-                        template,
-                        repository,
-                        &worktree.path,
-                        workspace_root,
-                        instance,
-                    )
-                    .await;
-                }
-                managed_keys.insert(key);
-            }
-            Err(err) => {
-                report.processes.push(ProcessReport {
-                    repository_id: template.key.repository_id.display(),
-                    git_root: repository.root.clone(),
-                    git_common_dir: repository.common_dir.clone(),
-                    worktree: worktree.path.clone(),
-                    workspace_root: workspace_root.clone(),
-                    server: template.key.server.clone(),
-                    status: "spawn-error",
-                    pid: None,
-                    clients: None,
-                    idle_for: None,
-                });
-                warn!(?workspace_root, ?err, "failed to prewarm language server");
-            }
+            managed_keys.insert(key);
+        }
+        Err(err) => {
+            report.processes.push(ProcessReport {
+                repository_id: template.key.repository_id.display(),
+                git_root: repository.root.clone(),
+                git_common_dir: repository.common_dir.clone(),
+                worktree: worktree.path.clone(),
+                workspace_root: workspace_root.clone(),
+                worktree_last_changed: worktree.last_changed,
+                server: template.key.server.clone(),
+                status: "spawn-error",
+                pid: None,
+                clients: None,
+                idle_for: None,
+            });
+            warn!(?workspace_root, ?err, "failed to prewarm language server");
         }
     }
 }
@@ -430,6 +503,7 @@ async fn push_instance_report(
     repository: &TrackedRepository,
     worktree: &Path,
     workspace_root: PathBuf,
+    worktree_last_changed: Option<SystemTime>,
     instance: Arc<instance::Instance>,
 ) {
     let clients = instance.client_count().await;
@@ -451,6 +525,7 @@ async fn push_instance_report(
         git_common_dir: repository.common_dir.clone(),
         worktree: worktree.to_owned(),
         workspace_root,
+        worktree_last_changed,
         server: template.key.server.clone(),
         status,
         pid: Some(instance.pid()),
@@ -471,6 +546,7 @@ fn log_report(report: &PollReport) {
         running_processes = report.running,
         connected_processes = report.connected,
         prewarmed_processes = report.prewarmed,
+        queued_processes = report.queued,
         stale_closed = report.stale_closed,
         stale_retained = report.stale_retained,
         "git worktree prewarm status",
@@ -483,6 +559,7 @@ fn log_report(report: &PollReport) {
             git_common_dir = ?process.git_common_dir,
             worktree = ?process.worktree,
             workspace_root = ?process.workspace_root,
+            worktree_last_changed = ?process.worktree_last_changed,
             server = ?process.server,
             status = process.status,
             pid = ?process.pid,
@@ -506,6 +583,30 @@ async fn close_if_idle(instance_map: Arc<Mutex<InstanceMap>>, key: &InstanceKey)
     } else {
         false
     }
+}
+
+async fn prewarm_spawn_available(
+    instance_map: Arc<Mutex<InstanceMap>>,
+    last_spawn: Option<&LastPrewarmSpawn>,
+) -> bool {
+    let Some(last_spawn) = last_spawn else {
+        return true;
+    };
+
+    if last_spawn.at.elapsed() >= PREWARM_SPAWN_INTERVAL {
+        return true;
+    }
+
+    let Some(key) = &last_spawn.key else {
+        return false;
+    };
+
+    instance_map
+        .lock()
+        .await
+        .get(key)
+        .map(|instance| instance.server_ready())
+        .unwrap_or(true)
 }
 
 async fn build_instance(
@@ -658,7 +759,13 @@ async fn list_worktrees(git_common_dir: &Path) -> Result<Vec<Worktree>> {
         );
     }
 
-    parse_worktree_list(&output.stdout)
+    let mut worktrees = parse_worktree_list(&output.stdout)?;
+    for worktree in &mut worktrees {
+        worktree.last_changed = worktree_last_changed(&worktree.path).await;
+    }
+    sort_worktrees_by_recency(&mut worktrees);
+
+    Ok(worktrees)
 }
 
 fn parse_worktree_list(output: &[u8]) -> Result<Vec<Worktree>> {
@@ -681,6 +788,7 @@ fn parse_worktree_list(output: &[u8]) -> Result<Vec<Worktree>> {
             current = Some(Worktree {
                 path: PathBuf::from(path),
                 prunable: false,
+                last_changed: None,
             });
             continue;
         }
@@ -697,6 +805,96 @@ fn parse_worktree_list(output: &[u8]) -> Result<Vec<Worktree>> {
     }
 
     Ok(worktrees)
+}
+
+async fn worktree_last_changed(worktree_path: &Path) -> Option<SystemTime> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--modified",
+            "--others",
+            "--exclude-standard",
+        ])
+        .output()
+        .await
+        .ok()?;
+
+    let root = worktree_path.to_owned();
+    let paths = if output.status.success() {
+        parse_git_ls_files_z(&output.stdout).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    task::spawn_blocking(move || newest_mtime_for_paths(&root, &paths))
+        .await
+        .ok()
+        .flatten()
+}
+
+fn parse_git_ls_files_z(output: &[u8]) -> Result<Vec<PathBuf>> {
+    output
+        .split(|byte| *byte == b'\0')
+        .filter(|field| !field.is_empty())
+        .map(|field| {
+            let path = std::str::from_utf8(field).context("git ls-files output was not utf-8")?;
+            Ok(PathBuf::from(path))
+        })
+        .collect()
+}
+
+fn newest_mtime_for_paths(root: &Path, relative_paths: &[PathBuf]) -> Option<SystemTime> {
+    let mut newest = modified_time(root);
+    for relative_path in relative_paths {
+        let path = root.join(relative_path);
+        if let Some(modified) = modified_time(&path) {
+            newest = max_system_time(newest, modified);
+        }
+    }
+    newest
+}
+
+fn modified_time(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
+fn max_system_time(current: Option<SystemTime>, candidate: SystemTime) -> Option<SystemTime> {
+    match current {
+        Some(current) => Some(current.max(candidate)),
+        None => Some(candidate),
+    }
+}
+
+fn sort_worktrees_by_recency(worktrees: &mut [Worktree]) {
+    worktrees.sort_by(|left, right| {
+        right
+            .last_changed
+            .cmp(&left.last_changed)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+}
+
+fn sort_candidates_by_recency(candidates: &mut [PrewarmCandidate]) {
+    candidates.sort_by(|left, right| {
+        right
+            .worktree
+            .last_changed
+            .cmp(&left.worktree.last_changed)
+            .then_with(|| left.worktree.path.cmp(&right.worktree.path))
+            .then_with(|| {
+                left.template
+                    .key
+                    .relative_workspace_root
+                    .cmp(&right.template.key.relative_workspace_root)
+            })
+            .then_with(|| left.template.key.server.cmp(&right.template.key.server))
+    });
 }
 
 fn prefix_to_relative_path(prefix: &str) -> PathBuf {
@@ -850,16 +1048,60 @@ mod tests {
                 Worktree {
                     path: PathBuf::from("/repo"),
                     prunable: false,
+                    last_changed: None,
                 },
                 Worktree {
                     path: PathBuf::from("/repo-wt"),
                     prunable: false,
+                    last_changed: None,
                 },
                 Worktree {
                     path: PathBuf::from("/missing"),
                     prunable: true,
+                    last_changed: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn parses_git_ls_files_z_output() {
+        assert_eq!(
+            parse_git_ls_files_z(b"src/main.rs\0Cargo.toml\0").unwrap(),
+            vec![PathBuf::from("src/main.rs"), PathBuf::from("Cargo.toml")]
+        );
+    }
+
+    #[test]
+    fn sorts_worktrees_by_recent_activity() {
+        let older = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
+        let mut worktrees = vec![
+            Worktree {
+                path: PathBuf::from("/old"),
+                prunable: false,
+                last_changed: Some(older),
+            },
+            Worktree {
+                path: PathBuf::from("/unknown"),
+                prunable: false,
+                last_changed: None,
+            },
+            Worktree {
+                path: PathBuf::from("/new"),
+                prunable: false,
+                last_changed: Some(newer),
+            },
+        ];
+
+        sort_worktrees_by_recency(&mut worktrees);
+
+        assert_eq!(
+            worktrees
+                .iter()
+                .map(|worktree| worktree.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new("/new"), Path::new("/old"), Path::new("/unknown")]
         );
     }
 

@@ -5,7 +5,7 @@ use std::io::ErrorKind;
 use std::ops::Deref;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use std::{env, fmt};
@@ -137,6 +137,9 @@ pub struct Instance {
     /// Uses seconds elapsed since an arbitrary point in the past, as returned
     /// by [`elapsed_seconds`].
     last_used: AtomicI64,
+
+    /// Whether the server has reported that startup/background work is done.
+    server_ready: AtomicBool,
 }
 
 impl Drop for Instance {
@@ -199,6 +202,16 @@ impl Instance {
 
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    pub fn server_ready(&self) -> bool {
+        self.server_ready.load(Ordering::Relaxed)
+    }
+
+    fn mark_server_ready(&self) {
+        if !self.server_ready.swap(true, Ordering::Relaxed) {
+            debug!("server reported ready");
+        }
     }
 
     /// Add client to the instance so it can receive traffic from it
@@ -709,6 +722,7 @@ async fn spawn(
         dynamic_capabilities: Mutex::default(),
         close: Notify::new(),
         last_used: AtomicI64::new(elapsed_seconds()),
+        server_ready: AtomicBool::new(false),
     });
 
     task::spawn(stdout_task(instance.clone(), reader).in_current_span());
@@ -1063,6 +1077,12 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
             }
 
             Message::Notification(notif) => {
+                if notif.method == "experimental/serverStatus"
+                    && notif.params.get("quiescent").and_then(Value::as_bool) == Some(true)
+                {
+                    instance.mark_server_ready();
+                }
+
                 // Server notifications don't expect a response. We can forward
                 // them to all clients.
                 for client in instance.clients().await {
