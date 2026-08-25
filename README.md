@@ -139,6 +139,18 @@ git_worktree_poll_interval = 30 # every 30 seconds
 # least recently changed, with at most one speculative spawn per minute unless
 # the previous server reports that startup/background work is done.
 
+# root directory under which lspmux creates rust-analyzer target directories.
+# the default ${cache_dir} placeholder expands to your platform cache directory,
+# for example ~/.cache/lspmux on Linux.
+rust_analyzer_target_dir_root = "${cache_dir}/rust-analyzer-targets"
+
+# how rust-analyzer target directories are grouped:
+# - "shared" uses one target directory for all rust-analyzer instances.
+# - "per-git-remote" uses one target directory per Git origin URL, falling back
+#   to the workspace path when no origin is configured.
+# - "per-instance" uses one target directory per lspmux rust-analyzer instance.
+rust_analyzer_target_dir_grouping = "per-instance"
+
 # ip address and port on which lspmux server listens
 # or unix socket path on *nix operating systems
 #

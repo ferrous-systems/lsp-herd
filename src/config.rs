@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
-#[cfg(target_family = "unix")]
 use std::path::PathBuf;
 use std::{fmt, fs};
 
@@ -31,6 +30,14 @@ mod default {
     pub fn git_worktree_poll_interval() -> u32 {
         // 30 seconds
         30
+    }
+
+    pub fn rust_analyzer_target_dir_root() -> PathBuf {
+        PathBuf::from("${cache_dir}/rust-analyzer-targets")
+    }
+
+    pub fn rust_analyzer_target_dir_grouping() -> RustAnalyzerTargetDirGrouping {
+        RustAnalyzerTargetDirGrouping::PerInstance
     }
 
     pub fn listen() -> Address {
@@ -170,6 +177,14 @@ impl fmt::Display for Filter {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RustAnalyzerTargetDirGrouping {
+    Shared,
+    PerGitRemote,
+    PerInstance,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -187,6 +202,12 @@ pub struct Config {
     #[serde(default = "default::git_worktree_poll_interval")]
     #[serde(deserialize_with = "de::git_worktree_poll_interval")]
     pub git_worktree_poll_interval: u32,
+
+    #[serde(default = "default::rust_analyzer_target_dir_root")]
+    pub rust_analyzer_target_dir_root: PathBuf,
+
+    #[serde(default = "default::rust_analyzer_target_dir_grouping")]
+    pub rust_analyzer_target_dir_grouping: RustAnalyzerTargetDirGrouping,
 
     #[serde(default = "default::listen")]
     pub listen: Address,
@@ -218,6 +239,22 @@ fn generate_default_and_check_it_matches_commited_defaults() {
     assert_eq!(generated_defaults, saved_defaults);
 }
 
+#[cfg(test)]
+#[test]
+fn parses_rust_analyzer_target_dir_grouping() {
+    let config = toml::from_str::<Config>(
+        r#"
+        rust_analyzer_target_dir_grouping = "per-git-remote"
+        "#,
+    )
+    .expect("parse config");
+
+    assert_eq!(
+        config.rust_analyzer_target_dir_grouping,
+        RustAnalyzerTargetDirGrouping::PerGitRemote
+    );
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -225,6 +262,8 @@ impl Default for Config {
             gc_interval: default::gc_interval(),
             git_worktree_prewarm: default::git_worktree_prewarm(),
             git_worktree_poll_interval: default::git_worktree_poll_interval(),
+            rust_analyzer_target_dir_root: default::rust_analyzer_target_dir_root(),
+            rust_analyzer_target_dir_grouping: default::rust_analyzer_target_dir_grouping(),
             listen: default::listen(),
             connect: default::connect(),
             log_filters: default::log_filters(),
@@ -245,6 +284,28 @@ impl Config {
         let config_data =
             fs::read(&config_path).with_context(|| format!("cannot read config file `{path}`"))?;
         toml::from_slice(&config_data).with_context(|| format!("cannot parse config file `{path}`"))
+    }
+
+    pub fn resolved_rust_analyzer_target_dir_root(&self) -> PathBuf {
+        const CACHE_DIR_PLACEHOLDER: &str = "${cache_dir}";
+
+        let root = self.rust_analyzer_target_dir_root.to_string_lossy();
+        let root = if root.contains(CACHE_DIR_PLACEHOLDER) {
+            let cache_dir = project_dirs()
+                .map(|dirs| dirs.cache_dir().to_owned())
+                .unwrap_or_else(|| std::env::temp_dir().join(env!("CARGO_PKG_NAME")));
+            PathBuf::from(root.replace(CACHE_DIR_PLACEHOLDER, cache_dir.to_string_lossy().as_ref()))
+        } else {
+            self.rust_analyzer_target_dir_root.clone()
+        };
+
+        if root.is_absolute() {
+            root
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(root)
+        }
     }
 
     /// Configure tracing-subscriber with env filter set to `log_filters` (if
@@ -269,4 +330,8 @@ impl Config {
             .with(format)
             .init();
     }
+}
+
+fn project_dirs() -> Option<ProjectDirs> {
+    ProjectDirs::from("", "", env!("CARGO_PKG_NAME"))
 }

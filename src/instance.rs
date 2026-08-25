@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::ErrorKind;
 use std::ops::Deref;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -20,7 +20,7 @@ use tokio::{select, task};
 use tracing::{debug, error, field, info, instrument, trace, warn, Instrument};
 
 use crate::client::Client;
-use crate::config::Config;
+use crate::config::{Config, RustAnalyzerTargetDirGrouping};
 use crate::lsp::ext::Tag;
 use crate::lsp::jsonrpc::{Message, Notification, Request, RequestId, ResponseSuccess, Version};
 use crate::lsp::transport::{LspReader, LspWriter};
@@ -514,11 +514,26 @@ impl Instance {
     }
 }
 
-pub struct InstanceMap(HashMap<InstanceKey, Arc<Instance>>);
+pub struct InstanceMap {
+    instances: HashMap<InstanceKey, Arc<Instance>>,
+    rust_analyzer_target_dirs: RustAnalyzerTargetDirs,
+}
+
+#[derive(Clone)]
+struct RustAnalyzerTargetDirs {
+    root: PathBuf,
+    grouping: RustAnalyzerTargetDirGrouping,
+}
 
 impl InstanceMap {
     pub fn new(config: &Config) -> Arc<Mutex<Self>> {
-        let instance_map = Arc::new(Mutex::new(InstanceMap(HashMap::new())));
+        let instance_map = Arc::new(Mutex::new(InstanceMap {
+            instances: HashMap::new(),
+            rust_analyzer_target_dirs: RustAnalyzerTargetDirs {
+                root: config.resolved_rust_analyzer_target_dir_root(),
+                grouping: config.rust_analyzer_target_dir_grouping,
+            },
+        }));
         task::spawn(gc_task(
             instance_map.clone(),
             config.gc_interval,
@@ -532,7 +547,7 @@ impl InstanceMap {
     ///
     /// This returns owned data to allow callers to drop the lock immediately.
     pub fn get_by_cwd(&self, cwd: &str) -> Option<Arc<Instance>> {
-        self.0
+        self.instances
             .iter()
             .filter(|(key, _)| Path::new(cwd).starts_with(&key.workspace_root.path))
             .max_by_key(|(key, _)| key.workspace_root.path.len())
@@ -543,11 +558,11 @@ impl InstanceMap {
     ///
     /// This returns owned data to allow callers to drop the lock immediately.
     pub fn instances(&self) -> Vec<Arc<Instance>> {
-        self.0.values().cloned().collect()
+        self.instances.values().cloned().collect()
     }
 
     pub fn get(&self, key: &InstanceKey) -> Option<Arc<Instance>> {
-        self.0.get(key).cloned()
+        self.instances.get(key).cloned()
     }
 }
 
@@ -601,16 +616,25 @@ pub async fn get_or_spawn(
     // doesn't try to lock its copy as well. This is a bit unfortunate code
     // organization but we want to have spawn in a separate tracing context and
     // we want to include `wait_task` in it as well in it as well
-    match map.clone().lock().await.0.entry(key.clone()) {
+    let map_clone = map.clone();
+    let mut map_guard = map_clone.lock().await;
+    let rust_analyzer_target_dirs = map_guard.rust_analyzer_target_dirs.clone();
+    match map_guard.instances.entry(key.clone()) {
         Entry::Occupied(e) => {
             info!("reusing language server instance");
             e.get().add_client(client).await;
             Ok(e.get().clone())
         }
         Entry::Vacant(e) => {
-            let instance = spawn(key, init_req_params, map, Some(client))
-                .await
-                .context("spawning instance")?;
+            let instance = spawn(
+                key,
+                init_req_params,
+                map,
+                rust_analyzer_target_dirs,
+                Some(client),
+            )
+            .await
+            .context("spawning instance")?;
             e.insert(instance.clone());
             Ok(instance)
         }
@@ -626,16 +650,167 @@ pub async fn prewarm(
     key: InstanceKey,
     init_req_params: lsp::InitializeParams,
 ) -> Result<Option<Arc<Instance>>> {
-    match map.clone().lock().await.0.entry(key.clone()) {
+    let map_clone = map.clone();
+    let mut map_guard = map_clone.lock().await;
+    let rust_analyzer_target_dirs = map_guard.rust_analyzer_target_dirs.clone();
+    match map_guard.instances.entry(key.clone()) {
         Entry::Occupied(_) => Ok(None),
         Entry::Vacant(e) => {
-            let instance = spawn(key, init_req_params, map, None)
+            let instance = spawn(key, init_req_params, map, rust_analyzer_target_dirs, None)
                 .await
                 .context("spawning instance")?;
             e.insert(instance.clone());
             Ok(Some(instance))
         }
     }
+}
+
+async fn apply_rust_analyzer_target_dir(
+    key: &InstanceKey,
+    config: &RustAnalyzerTargetDirs,
+    init_req_params: &mut lsp::InitializeParams,
+) -> Result<()> {
+    if !is_rust_analyzer_server(&key.server) {
+        return Ok(());
+    }
+
+    let target_dir = rust_analyzer_target_dir(key, config).await?;
+    tokio::fs::create_dir_all(&target_dir)
+        .await
+        .with_context(|| format!("creating rust-analyzer target directory {target_dir:?}"))?;
+    set_rust_analyzer_target_dir(init_req_params, &target_dir)?;
+
+    info!(?target_dir, "configured rust-analyzer target directory");
+    Ok(())
+}
+
+async fn rust_analyzer_target_dir(
+    key: &InstanceKey,
+    config: &RustAnalyzerTargetDirs,
+) -> Result<PathBuf> {
+    let directory = match config.grouping {
+        RustAnalyzerTargetDirGrouping::Shared => "shared".to_owned(),
+        RustAnalyzerTargetDirGrouping::PerGitRemote => {
+            let remote = git_remote_or_workspace_key(key.workspace_root.path()).await;
+            format!("remote-{}", stable_hash([remote]))
+        }
+        RustAnalyzerTargetDirGrouping::PerInstance => {
+            format!("instance-{}", stable_hash(instance_hash_parts(key)))
+        }
+    };
+
+    Ok(config.root.join(directory))
+}
+
+fn is_rust_analyzer_server(server: &str) -> bool {
+    matches!(
+        Path::new(server).file_name().and_then(|name| name.to_str()),
+        Some("rust-analyzer" | "rust-analyzer.exe")
+    )
+}
+
+async fn git_remote_or_workspace_key(workspace_root: &str) -> String {
+    if let Some(remote) = git_remote_url(workspace_root, ["remote", "get-url", "origin"]).await {
+        return remote;
+    }
+    if let Some(remote) = git_remote_url(workspace_root, ["remote", "-v"]).await {
+        return first_fetch_remote_url(&remote).unwrap_or(remote);
+    }
+
+    workspace_root.to_owned()
+}
+
+async fn git_remote_url<const N: usize>(workspace_root: &str, args: [&str; N]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(args)
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let remote = stdout.trim();
+    (!remote.is_empty()).then(|| remote.to_owned())
+}
+
+fn first_fetch_remote_url(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(_) = fields.next() else {
+            continue;
+        };
+        let Some(url) = fields.next() else {
+            continue;
+        };
+        if fields.next() == Some("(fetch)") {
+            return Some(url.to_owned());
+        }
+    }
+
+    None
+}
+
+fn instance_hash_parts(key: &InstanceKey) -> Vec<String> {
+    let mut parts = vec![
+        key.server.clone(),
+        key.workspace_root.path.clone(),
+        key.workspace_root.device_id.to_string(),
+        key.workspace_root.file_id.to_string(),
+    ];
+    parts.extend(key.args.iter().map(|arg| format!("arg:{arg}")));
+    parts.extend(
+        key.env
+            .iter()
+            .map(|(name, value)| format!("env:{name}={value}")),
+    );
+    parts
+}
+
+fn stable_hash(parts: impl IntoIterator<Item = String>) -> String {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET;
+    for part in parts {
+        for byte in part.as_bytes().iter().copied().chain([0]) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+
+    format!("{hash:016x}")
+}
+
+fn set_rust_analyzer_target_dir(
+    init_req_params: &mut lsp::InitializeParams,
+    target_dir: &Path,
+) -> Result<()> {
+    let target_dir = target_dir
+        .to_str()
+        .with_context(|| format!("target directory is not valid utf-8: {target_dir:?}"))?
+        .to_owned();
+    let options = init_req_params
+        .initialization_options
+        .get_or_insert_with(Default::default);
+
+    let cargo = options
+        .other_options
+        .entry("cargo".to_owned())
+        .or_insert_with(|| json!({}));
+    if !cargo.is_object() {
+        *cargo = json!({});
+    }
+    cargo
+        .as_object_mut()
+        .expect("cargo option object inserted above")
+        .insert("targetDir".to_owned(), Value::String(target_dir));
+
+    Ok(())
 }
 
 #[instrument(name = "instance", fields(pid = field::Empty), skip_all, parent = None)]
@@ -646,8 +821,13 @@ async fn spawn(
     // lock it within this function to not cause deadlock, only spawned tasks
     // are allowed to lock it again.
     map: Arc<Mutex<InstanceMap>>,
+    rust_analyzer_target_dirs: RustAnalyzerTargetDirs,
     client: Option<Client>,
 ) -> Result<Arc<Instance>> {
+    apply_rust_analyzer_target_dir(&key, &rust_analyzer_target_dirs, &mut init_req_params)
+        .await
+        .context("configure rust-analyzer target directory")?;
+
     let mut child = Command::new(&key.server)
         .args(&key.args)
         .envs(&key.env)
@@ -868,7 +1048,7 @@ async fn wait_task(
             }
             exit = child.wait() => {
                 // Remove the closing instance from the map so new clients spawn their own instance
-                instance_map.lock().await.0.remove(&key);
+                instance_map.lock().await.instances.remove(&key);
 
                 // Disconnect all current clients
                 //
@@ -1100,4 +1280,111 @@ fn empty_workspace_configuration_response(params: &Value) -> Value {
         .map(Vec::len)
         .unwrap_or_default();
     Value::Array(vec![Value::Null; len])
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::lsp::{InitializationOptions, TraceValue};
+
+    fn workspace_root(path: &str) -> WorkspaceRoot {
+        WorkspaceRoot {
+            path: path.to_owned(),
+            device_id: 1,
+            file_id: 2,
+        }
+    }
+
+    fn instance_key(path: &str) -> InstanceKey {
+        InstanceKey {
+            server: "rust-analyzer".to_owned(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            workspace_root: workspace_root(path),
+        }
+    }
+
+    fn init_params() -> lsp::InitializeParams {
+        lsp::InitializeParams {
+            process_id: Some(123),
+            client_info: None,
+            locale: None,
+            root_path: Some("/repo".into()),
+            root_uri: Some("file:///repo".into()),
+            initialization_options: Some(InitializationOptions {
+                lsp_mux: None,
+                other_options: serde_json::Map::from_iter([(
+                    "cargo".into(),
+                    json!({ "features": ["unstable"], "targetDir": "client-target" }),
+                )]),
+            }),
+            capabilities: None,
+            trace: Some(TraceValue::Off),
+            workspace_folders: None,
+        }
+    }
+
+    #[test]
+    fn detects_rust_analyzer_server_binary() {
+        assert!(is_rust_analyzer_server("rust-analyzer"));
+        assert!(is_rust_analyzer_server("/usr/bin/rust-analyzer"));
+        assert!(!is_rust_analyzer_server("clangd"));
+    }
+
+    #[test]
+    fn parses_first_fetch_remote_for_target_grouping() {
+        assert_eq!(
+            first_fetch_remote_url(
+                "upstream\thttps://example.com/repo.git (fetch)\n\
+                 upstream\thttps://example.com/repo.git (push)\n",
+            )
+            .as_deref(),
+            Some("https://example.com/repo.git")
+        );
+    }
+
+    #[test]
+    fn injects_rust_analyzer_target_dir_without_dropping_cargo_options() {
+        let mut params = init_params();
+
+        set_rust_analyzer_target_dir(&mut params, Path::new("/tmp/lspmux-ra-target")).unwrap();
+
+        let options = params.initialization_options.unwrap().other_options;
+        assert_eq!(options["cargo"]["features"], json!(["unstable"]));
+        assert_eq!(
+            options["cargo"]["targetDir"],
+            json!("/tmp/lspmux-ra-target")
+        );
+    }
+
+    #[tokio::test]
+    async fn target_dir_grouping_shapes_paths() {
+        let root = PathBuf::from("/tmp/lspmux-ra-root");
+        let shared = RustAnalyzerTargetDirs {
+            root: root.clone(),
+            grouping: RustAnalyzerTargetDirGrouping::Shared,
+        };
+        assert_eq!(
+            rust_analyzer_target_dir(&instance_key("/repo"), &shared)
+                .await
+                .unwrap(),
+            root.join("shared")
+        );
+
+        let per_instance = RustAnalyzerTargetDirs {
+            root: root.clone(),
+            grouping: RustAnalyzerTargetDirGrouping::PerInstance,
+        };
+        let first = rust_analyzer_target_dir(&instance_key("/repo-a"), &per_instance)
+            .await
+            .unwrap();
+        let second = rust_analyzer_target_dir(&instance_key("/repo-b"), &per_instance)
+            .await
+            .unwrap();
+        assert!(first.starts_with(&root));
+        assert!(second.starts_with(&root));
+        assert_ne!(first, second);
+    }
 }
