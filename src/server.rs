@@ -14,11 +14,19 @@ use crate::tui;
 
 pub async fn run(config: &Config) -> Result<()> {
     let instance_map = InstanceMap::new(config);
-    let prewarm_tracker = config.git_worktree_prewarm.then(|| {
+    let prewarm_tracker = if config.git_worktree_prewarm {
         let tracker = PrewarmTracker::new(config.git_worktree_poll_interval);
+        for repository in &config.git_worktree_prewarm_repositories {
+            tracker
+                .record_configured_repository(repository, config)
+                .await
+                .with_context(|| format!("prewarm repository {:?}", repository.path))?;
+        }
         tracker.start(instance_map.clone());
-        tracker
-    });
+        Some(tracker)
+    } else {
+        None
+    };
     if config.status_ui && std::io::stdout().is_terminal() {
         tui::start(instance_map.clone(), prewarm_tracker.clone());
     }

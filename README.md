@@ -209,6 +209,38 @@ log_filters = "info"
 pass_environment = ["*"]
 ```
 
+### Prewarming repositories at startup
+
+To preload worktrees before opening an editor, add entries to the end of
+`~/.config/lsp-herd/config.toml`:
+
+```toml
+[[git_worktree_prewarm_repositories]]
+path = "/home/user/projects/my-repo"
+# server = "rust-analyzer" # default; resolved using the server's PATH
+# args = []
+# initialization_options = { check = { command = "clippy" } }
+```
+
+Each path must be an existing directory inside a Git worktree. Use an absolute
+path; relative paths resolve from the server's working directory, and `~` is not
+expanded. To preload a workspace in a subdirectory of every worktree, point
+`path` at that subdirectory instead. Repeat the table for additional repositories.
+
+Restart `lsp-herd server` after changing the list. With
+`git_worktree_prewarm = true` (the default), the server discovers these
+repositories at startup and uses the same polling, spawn limits, and worktree
+lifecycle as editor-triggered prewarming. Invalid paths cause a startup error.
+Setting `git_worktree_prewarm = false` disables both forms of prewarming.
+
+Startup prewarming uses the server process's environment, filtered by
+`pass_environment`, and minimal LSP client capabilities. Set
+`initialization_options` to the language server settings you want applied before
+an editor connects. As with other shared instances, the first initialization
+determines those settings. Editors reuse a prewarmed instance when the workspace,
+server command, arguments, and filtered environment match; use
+`pass_environment` to exclude editor-specific variables if necessary.
+
 
 ## Other LSP servers
 

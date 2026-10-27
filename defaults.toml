@@ -9,3 +9,4 @@ listen = ["127.0.0.1", 27631]
 connect = ["127.0.0.1", 27631]
 log_filters = "info"
 pass_environment = ["*"]
+git_worktree_prewarm_repositories = []

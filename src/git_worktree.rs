@@ -11,8 +11,9 @@ use tokio::sync::Mutex;
 use tokio::task;
 use tracing::{debug, info, info_span, instrument, warn, Instrument};
 
+use crate::config::{Config, PrewarmRepository};
 use crate::instance::{self, InstanceKey, InstanceMap, WorkspaceRoot};
-use crate::lsp::{InitializeParams, WorkspaceFolder};
+use crate::lsp::{InitializationOptions, InitializeParams, WorkspaceFolder};
 
 const WORKSPACE_ROOT_ENV: &str = "${LSP_HERD_WORKSPACE_ROOT}";
 const GIT_ROOT_ENV: &str = "${LSP_HERD_GIT_ROOT}";
@@ -234,6 +235,56 @@ impl PrewarmTracker {
         }
     }
 
+    pub async fn record_configured_repository(
+        &self,
+        repository: &PrewarmRepository,
+        config: &Config,
+    ) -> Result<()> {
+        let workspace_root = tokio::fs::canonicalize(&repository.path)
+            .await
+            .context("resolve workspace path")?;
+        let repo = discover_repository(&workspace_root)
+            .await?
+            .context("workspace path is not inside a git worktree")?;
+        let workspace_root_path = path_to_string(&workspace_root)?;
+        let init_params = InitializeParams {
+            process_id: None,
+            client_info: None,
+            locale: None,
+            root_path: Some(workspace_root_path),
+            root_uri: Some(file_uri(&workspace_root)?),
+            initialization_options: Some(InitializationOptions {
+                lsp_mux: None,
+                other_options: repository.initialization_options.clone(),
+            }),
+            capabilities: Some(serde_json::json!({})),
+            trace: None,
+            workspace_folders: None,
+        };
+        let env = std::env::vars()
+            .filter(|(key, _)| {
+                config
+                    .pass_environment
+                    .iter()
+                    .any(|filter| !filter.negative && filter.pattern.matches(key))
+                    && !config
+                        .pass_environment
+                        .iter()
+                        .any(|filter| filter.negative && filter.pattern.matches(key))
+            })
+            .collect();
+        self.record_template(
+            repo,
+            workspace_root,
+            repository.server.clone(),
+            repository.args.clone(),
+            env,
+            init_params,
+        )
+        .await;
+        Ok(())
+    }
+
     #[instrument(skip_all, fields(workspace_root = %workspace_root))]
     pub async fn record_client(
         &self,
@@ -249,6 +300,20 @@ impl PrewarmTracker {
             return Ok(());
         };
 
+        self.record_template(repo, workspace_root, server, args, env, init_params)
+            .await;
+        Ok(())
+    }
+
+    async fn record_template(
+        &self,
+        repo: Repository,
+        workspace_root: PathBuf,
+        server: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        init_params: InitializeParams,
+    ) {
         let env_template = normalize_env(&env, &repo.root, &workspace_root);
         let key = TemplateKey {
             repository_id: repo.id.clone(),
@@ -276,8 +341,6 @@ impl PrewarmTracker {
         } else {
             debug!("updated git worktree prewarm template");
         }
-
-        Ok(())
     }
 
     async fn poll_task(&self, instance_map: Arc<Mutex<InstanceMap>>) {
@@ -1107,6 +1170,142 @@ mod tests {
     use crate::lsp::{InitializationOptions, TraceValue};
 
     use super::*;
+
+    struct TestRepository(PathBuf);
+
+    impl TestRepository {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "lsp-herd-prewarm-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn git(&self, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.0)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    impl Drop for TestRepository {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_repository_discovers_worktrees_without_a_client() {
+        let repo = TestRepository::new();
+        repo.git(&["init"]);
+        repo.git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ]);
+        repo.git(&["worktree", "add", "--detach", "other"]);
+        fs::create_dir(repo.0.join("rust")).unwrap();
+        fs::create_dir(repo.0.join("other/rust")).unwrap();
+
+        let config = Config {
+            pass_environment: vec![],
+            ..Config::default()
+        };
+        let repository = PrewarmRepository {
+            path: repo.0.join("rust"),
+            server: "custom-rust-analyzer".into(),
+            args: vec!["--quiet".into()],
+            initialization_options: serde_json::Map::from_iter([(
+                "check".into(),
+                json!({ "command": "clippy" }),
+            )]),
+        };
+        let tracker = PrewarmTracker::new(30);
+        tracker
+            .record_configured_repository(&repository, &config)
+            .await
+            .unwrap();
+        let (template, common_dir) = {
+            let state = tracker.state.lock().await;
+            assert_eq!(state.templates.len(), 1);
+            assert_eq!(state.repositories.len(), 1);
+            let template = state.templates.values().next().unwrap().clone();
+            assert_eq!(template.key.relative_workspace_root, Path::new("rust"));
+            let common_dir = state
+                .repositories
+                .values()
+                .next()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .common_dir
+                .clone();
+            (template, common_dir)
+        };
+        let worktrees = list_worktrees(&common_dir).await.unwrap();
+        assert_eq!(worktrees.len(), 2);
+        for worktree in worktrees {
+            let workspace_root = worktree.path.join("rust");
+            let (key, params) = build_instance(&template, &worktree.path, &workspace_root)
+                .await
+                .unwrap();
+            assert_eq!(key.server, "custom-rust-analyzer");
+            assert_eq!(key.args, ["--quiet"]);
+            assert!(key.env.is_empty());
+            assert_eq!(
+                key.workspace_root.path(),
+                path_to_string(&workspace_root).unwrap()
+            );
+            assert_eq!(params.root_uri.unwrap(), file_uri(&workspace_root).unwrap());
+            assert_eq!(
+                params.initialization_options.unwrap().other_options["check"]["command"],
+                "clippy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_repository_rejects_invalid_paths() {
+        let repo = TestRepository::new();
+        let mut repository = PrewarmRepository {
+            path: repo.0.clone(),
+            server: "rust-analyzer".into(),
+            args: vec![],
+            initialization_options: serde_json::Map::new(),
+        };
+        let tracker = PrewarmTracker::new(30);
+        let err = tracker
+            .record_configured_repository(&repository, &Config::default())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not inside a git worktree"));
+        repository.path = repo.0.join("missing");
+        let err = tracker
+            .record_configured_repository(&repository, &Config::default())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("resolve workspace path"));
+    }
 
     fn init_params() -> InitializeParams {
         InitializeParams {

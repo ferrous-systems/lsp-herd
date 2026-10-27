@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `git_worktree_prewarm_repositories` configuration to preload worktree language servers at startup without an editor connection
 - `sync` subcommand to allow reload the server's file state from disk when it gets desynced by conflicting diffs from multiple clients
 
 ### Fixed

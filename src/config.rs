@@ -32,6 +32,10 @@ mod default {
         30
     }
 
+    pub fn prewarm_server() -> String {
+        "rust-analyzer".to_owned()
+    }
+
     pub fn rust_analyzer_target_dir_root() -> PathBuf {
         PathBuf::from("${cache_dir}/rust-analyzer-targets")
     }
@@ -191,6 +195,21 @@ pub enum RustAnalyzerTargetDirGrouping {
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
+pub struct PrewarmRepository {
+    pub path: PathBuf,
+
+    #[serde(default = "default::prewarm_server")]
+    pub server: String,
+
+    #[serde(default)]
+    pub args: Vec<String>,
+
+    #[serde(default)]
+    pub initialization_options: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default::instance_timeout")]
     #[serde(deserialize_with = "de::instance_timeout")]
@@ -229,6 +248,9 @@ pub struct Config {
     #[serde(deserialize_with = "de::pass_environment")]
     #[serde(serialize_with = "ser::pass_environment")]
     pub pass_environment: Vec<Filter>,
+
+    #[serde(default)]
+    pub git_worktree_prewarm_repositories: Vec<PrewarmRepository>,
 }
 
 #[cfg(test)]
@@ -262,6 +284,44 @@ fn parses_rust_analyzer_target_dir_grouping() {
     );
 }
 
+#[cfg(test)]
+#[test]
+fn parses_and_roundtrips_prewarm_repositories() {
+    let config = toml::from_str::<Config>(
+        r#"
+        [[git_worktree_prewarm_repositories]]
+        path = "/repo"
+
+        [[git_worktree_prewarm_repositories]]
+        path = "/other/rust"
+        server = "/bin/rust-analyzer"
+        args = ["--log-file", "/tmp/ra.log"]
+        initialization_options = { check = { command = "clippy" } }
+        "#,
+    )
+    .expect("parse config");
+    let repositories = &config.git_worktree_prewarm_repositories;
+    assert_eq!(repositories[0].server, "rust-analyzer");
+    assert!(repositories[0].args.is_empty());
+    assert!(repositories[0].initialization_options.is_empty());
+    assert_eq!(repositories[1].path, PathBuf::from("/other/rust"));
+    assert_eq!(repositories[1].server, "/bin/rust-analyzer");
+    assert_eq!(repositories[1].args, ["--log-file", "/tmp/ra.log"]);
+    assert_eq!(
+        repositories[1].initialization_options["check"]["command"],
+        "clippy"
+    );
+    let serialized = toml::to_string(&config).expect("serialize config");
+    let roundtrip = toml::from_str::<Config>(&serialized).expect("parse serialized config");
+    assert_eq!(serialized, toml::to_string(&roundtrip).unwrap());
+    assert!(toml::from_str::<Config>(
+        r#"[[git_worktree_prewarm_repositories]]
+        path = "/repo"
+        typo = true"#
+    )
+    .is_err());
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -276,6 +336,7 @@ impl Default for Config {
             connect: default::connect(),
             log_filters: default::log_filters(),
             pass_environment: default::pass_environment(),
+            git_worktree_prewarm_repositories: Vec::new(),
         }
     }
 }
