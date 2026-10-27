@@ -71,7 +71,7 @@ pub struct InitializeParams {
 
     /// User provided initialization options
     ///
-    /// This is where lspmux-proxy should be inserting it's setup. However we
+    /// This is where lsp-herd-proxy should be inserting it's setup. However we
     /// should remove them again before forwarding them to the language server.
     pub initialization_options: Option<InitializationOptions>,
 

@@ -3,7 +3,7 @@
 <plist version="1.0">
   <dict>
     <key>Label</key>
-    <string>org.codeberg.p2502.lspmux</string>
+    <string>com.github.ferrous-systems.lsp-herd</string>
     <key>ProgramArguments</key>
     <array>
       <string>[PATH_TO_BIN]</string>
@@ -15,9 +15,9 @@
       <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin:[HOME]/.cargo/bin</string>
     </dict>
     <key>StandardOutPath</key>
-    <string>/tmp/lpsmux.log</string>
+    <string>/tmp/lsp-herd.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/lspmux.log</string>
+    <string>/tmp/lsp-herd.log</string>
     <key>KeepAlive</key>
     <true />
     <key>RunAtLoad</key>

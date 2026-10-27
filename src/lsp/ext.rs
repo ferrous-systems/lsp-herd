@@ -1,4 +1,4 @@
-//! lspmux specific protocol extensions
+//! lsp-herd specific protocol extensions
 
 use std::collections::BTreeMap;
 use std::str::FromStr;

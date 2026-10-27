@@ -3,7 +3,7 @@ Description=Language server multiplexer server
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/lspmux server
+ExecStart=/usr/local/bin/lsp-herd server
 
 [Install]
 WantedBy=default.target

@@ -2,8 +2,8 @@ use std::env;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use lspmux::config::Config;
-use lspmux::{ext, proxy, server};
+use lsp_herd::config::Config;
+use lsp_herd::{ext, proxy, server};
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -16,12 +16,12 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Connect to an lspmux server [default]
+    /// Connect to an lsp-herd server [default]
     Client {
         /// Path to the LSP server executable
         #[arg(
             long = "server-path",
-            env = "LSPMUX_SERVER",
+            env = "LSP_HERD_SERVER",
             default_value = "rust-analyzer",
             name = "SERVER_PATH"
         )]
@@ -32,7 +32,7 @@ enum Cmd {
         args: Vec<String>,
     },
 
-    /// Start a lpsmux server
+    /// Start an lsp-herd server
     Server {},
 
     /// Print server status
@@ -93,7 +93,8 @@ async fn main() -> Result<()> {
         Some(Cmd::Reload {}) => ext::reload(&config).await,
         Some(Cmd::Sync {}) => ext::sync(&config).await,
         None => {
-            let server_path = env::var("LSPMUX_SERVER").unwrap_or_else(|_| "rust-analyzer".into());
+            let server_path =
+                env::var("LSP_HERD_SERVER").unwrap_or_else(|_| "rust-analyzer".into());
             proxy::run(&config, server_path, vec![]).await
         }
     }

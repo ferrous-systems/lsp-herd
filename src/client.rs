@@ -44,7 +44,7 @@ pub async fn process(
     let mut init_params = serde_json::from_value::<InitializeParams>(req.params.clone())
         .context("parse `initialize` request params")?;
 
-    // Remove `lspMux` from `initializationOptions`, it's lspmux extension and
+    // Remove `lspMux` from `initializationOptions`, it's lsp-herd extension and
     // we don't want to forward it to the real language server.
     let options = init_params
         .initialization_options
@@ -60,7 +60,7 @@ pub async fn process(
         LspMuxOptions::PROTOCOL_VERSION,
     );
 
-    debug!(?options, "lspmux initialization");
+    debug!(?options, "lsp-herd initialization");
     match options.method {
         ext::Request::Connect {
             server,

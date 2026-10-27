@@ -14,8 +14,8 @@ use tracing::{debug, info, info_span, instrument, warn, Instrument};
 use crate::instance::{self, InstanceKey, InstanceMap, WorkspaceRoot};
 use crate::lsp::{InitializeParams, WorkspaceFolder};
 
-const WORKSPACE_ROOT_ENV: &str = "${LSPMUX_WORKSPACE_ROOT}";
-const GIT_ROOT_ENV: &str = "${LSPMUX_GIT_ROOT}";
+const WORKSPACE_ROOT_ENV: &str = "${LSP_HERD_WORKSPACE_ROOT}";
+const GIT_ROOT_ENV: &str = "${LSP_HERD_GIT_ROOT}";
 const PREWARM_SPAWN_INTERVAL: Duration = Duration::from_secs(60);
 
 const URI_PATH_ENCODE_SET: &AsciiSet = &CONTROLS

@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - avoid dropping early server requests, like `workspace/configuration`, fixes hangup when starting deno
 
 ### Changed
+- rename this fork to `lsp-herd`, including the executable, config/cache directories, service files, and `LSP_HERD_SERVER` environment variable
 - reduced the number of dependencies and dependency features to improve compile times slightly
 - make `status` subcommand output less verbose by default
 - `pass_environment` config option now uses globbing and supports negative filters. this lets users pass all environment variables except some specific ones

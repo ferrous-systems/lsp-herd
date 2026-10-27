@@ -1,8 +1,8 @@
 [package]
-name = "lspmux"
+name = "lsp-herd"
 version = "0.3.0"
 description = "share one language server instance between multiple LSP clients to save resources"
-repository = "https://codeberg.org/p2502/lspmux"
+repository = "https://github.com/ferrous-systems/lsp-herd"
 license = "EUPL-1.2"
 edition = "2021"
 

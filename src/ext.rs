@@ -19,8 +19,8 @@ where
         .await
         .context("connect")?
         .into_split();
-    let mut writer = LspWriter::new(writer, "lspmux");
-    let mut reader = LspReader::new(BufReader::new(reader), "lspmux");
+    let mut writer = LspWriter::new(writer, "lsp-herd");
+    let mut reader = LspReader::new(BufReader::new(reader), "lsp-herd");
 
     writer
         .write_message(
@@ -50,12 +50,12 @@ where
             .into(),
         )
         .await
-        .context("send lspmux request")?;
+        .context("send lsp-herd request")?;
 
     match reader
         .read_message()
         .await
-        .context("read lspmux response")?
+        .context("read lsp-herd response")?
         .context("stream ended")?
         .into_response()
         .context("received message was not a response")?

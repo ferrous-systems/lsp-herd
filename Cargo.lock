@@ -204,7 +204,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lspmux"
+name = "lsp-herd"
 version = "0.3.0"
 dependencies = [
  "anyhow",

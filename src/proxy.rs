@@ -42,7 +42,7 @@ pub async fn run(config: &Config, server: String, args: Vec<String>) -> Result<(
 
     let mut stream = Stream::connect(&config.connect).await.with_context(|| {
         format!(
-            "connecting to lspmux server at {:?}; start it with `lspmux server` \
+            "connecting to lsp-herd server at {:?}; start it with `lsp-herd server` \
                  or `cargo run -- server` while developing",
             config.connect,
         )
@@ -75,7 +75,7 @@ pub async fn run(config: &Config, server: String, args: Vec<String>) -> Result<(
     req.params = serde_json::to_value(params).expect("BUG: invalid data");
 
     // Forward the modified `initialize` request.
-    let mut writer = LspWriter::new(&mut stream, "lspmux");
+    let mut writer = LspWriter::new(&mut stream, "lsp-herd");
     writer
         .write_message(&req.into())
         .await

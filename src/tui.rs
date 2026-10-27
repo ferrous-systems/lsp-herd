@@ -87,7 +87,7 @@ fn render_status(prewarm: Option<PrewarmSnapshot>, instances: Vec<InstanceSnapsh
     }
 
     let mut output = String::new();
-    output.push_str("lspmux status\n");
+    output.push_str("lsp-herd status\n");
     output.push_str("=============\n");
     if let Some(prewarm) = &prewarm {
         output.push_str(&format!(
@@ -100,7 +100,7 @@ fn render_status(prewarm: Option<PrewarmSnapshot>, instances: Vec<InstanceSnapsh
     } else {
         output.push_str("git worktree prewarm: disabled\n");
     }
-    output.push_str("refresh: 1s; press Ctrl-C to stop lspmux\n\n");
+    output.push_str("refresh: 1s; press Ctrl-C to stop lsp-herd\n\n");
 
     if by_repository.is_empty() {
         output.push_str(

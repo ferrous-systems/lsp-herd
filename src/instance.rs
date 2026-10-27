@@ -911,7 +911,7 @@ async fn spawn(
 
     // Some LSP servers monitor client PIDs and exit if none remain (as
     // documented in the LSP spec). We need to replace the client PID in the
-    // initialization request with lspmux server PID to prevent the server from
+    // initialization request with lsp-herd server PID to prevent the server from
     // exitting when the original client exits.
     init_req_params.process_id = Some(std::process::id() as u64);
 
@@ -959,7 +959,7 @@ async fn initialize_handshake(
     reader: &mut LspReader<BufReader<ChildStdout>>,
     writer: &mut LspWriter<ChildStdin>,
 ) -> Result<lsp::InitializeResult> {
-    let request_id = "lspmux:initialize_request";
+    let request_id = "lsp-herd:initialize_request";
 
     // Use the first client's `InitializeParams` to initialize server. We assume
     // all subsequent clients configuration will be somewhat compatible with
@@ -990,7 +990,7 @@ async fn initialize_handshake(
     // we hold the `InstanceMap` lock _the whole time_ this loop is waiting,
     // the lock held in `instance::get_or_spawn` -> `instance::spawn` ->
     // `instance::initialize_handshake` which blocks _any_ connection to the
-    // lspmux client, as all the functions called from `client::process` sooner
+    // lsp-herd client, as all the functions called from `client::process` sooner
     // or later need to lock the `InstanceMap` as well.
     let res = loop {
         match reader
@@ -1092,7 +1092,7 @@ async fn wait_task(
 
                 // Disconnect all current clients
                 //
-                // We'll rely on the editor client to restart the lspmux client,
+                // We'll rely on the editor client to restart the lsp-herd client,
                 // start a new connection and we'll spawn another instance like
                 // we'd with any other new client.
                 instance.clients.lock().await.clear();
@@ -1389,19 +1389,19 @@ mod tests {
     fn injects_rust_analyzer_target_dir_without_dropping_cargo_options() {
         let mut params = init_params();
 
-        set_rust_analyzer_target_dir(&mut params, Path::new("/tmp/lspmux-ra-target")).unwrap();
+        set_rust_analyzer_target_dir(&mut params, Path::new("/tmp/lsp-herd-ra-target")).unwrap();
 
         let options = params.initialization_options.unwrap().other_options;
         assert_eq!(options["cargo"]["features"], json!(["unstable"]));
         assert_eq!(
             options["cargo"]["targetDir"],
-            json!("/tmp/lspmux-ra-target")
+            json!("/tmp/lsp-herd-ra-target")
         );
     }
 
     #[tokio::test]
     async fn target_dir_grouping_shapes_paths() {
-        let root = PathBuf::from("/tmp/lspmux-ra-root");
+        let root = PathBuf::from("/tmp/lsp-herd-ra-root");
         let shared = RustAnalyzerTargetDirs {
             root: root.clone(),
             grouping: RustAnalyzerTargetDirGrouping::Shared,
